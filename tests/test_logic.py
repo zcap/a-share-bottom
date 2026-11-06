@@ -192,3 +192,42 @@ def test_failed_stock_recovers_next_run(world, tmp_path):
     up, src = run_day(world, 51, d)
     assert ("history", "000002") in src.calls
     check_truth(world, up.stocks, 51)
+
+
+def test_universe_new_and_delisted():
+    """新股自动加入；退市（BaoStock 标记 status=0 或从列表消失）自动剔除；列表明显不全时不删。"""
+    from bottom.engine import Stock as St
+
+    class Src:
+        def __init__(self, rows, bj):
+            self.rows, self.bj = rows, bj
+
+        def stock_basic(self):
+            return self.rows
+
+        def bj_stock_list(self):
+            if self.bj is None:
+                raise ConnectionError("bse.cn down")
+            return self.bj
+
+    def row(code, status="1", ipo="2020-01-02", name="股"):
+        return {"code": code, "code_name": name, "ipoDate": ipo, "outDate": "", "type": "1", "status": status}
+
+    base = [row(f"sh.6000{i:02d}") for i in range(30)]
+    stocks = {f"6000{i:02d}": St(code=f"6000{i:02d}", mkt="sh", built="x") for i in range(30)}
+    stocks["920001"] = St(code="920001", mkt="bj", built="x")
+    # 600005 退市（status=0），600007 从列表消失，688999 新上市，688998 尚未到上市日
+    rows = [r for r in base if r["code"] not in ("sh.600007",)]
+    rows = [row(r["code"], status="0") if r["code"] == "sh.600005" else r for r in rows]
+    rows += [row("sh.688999", ipo="2024-03-01"), row("sh.688998", ipo="2024-03-10")]
+    up = Updater(Src(rows, None), stocks, {}, today="2024-03-05")
+    up.refresh_universe()
+    assert "600005" not in up.stocks and "600007" not in up.stocks
+    assert "688999" in up.stocks and up.stocks["688999"].built == ""  # 待用完整历史构建
+    assert "688998" not in up.stocks
+    assert "920001" in up.stocks  # 北交所列表获取失败时不删北交所股票
+    # 列表明显不全（只返回 10 只）时一只都不删
+    before = set(up.stocks)
+    up2 = Updater(Src(base[:10], []), dict(up.stocks), {}, today="2024-03-05")
+    up2.refresh_universe()
+    assert before <= set(up2.stocks)  # 北交所列表为空也不删

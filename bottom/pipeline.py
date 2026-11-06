@@ -151,25 +151,33 @@ class Updater:
             bj_ok = False
             self.note(f"⚠️ 北交所股票列表获取失败，本次沿用旧列表：{e}")
 
+        # 列表明显不全（比上次少一成以上）时，认为是数据源出错，这次不删除任何股票
+        n_bj = len(info) - n_shsz
         old_shsz = sum(1 for s in self.stocks.values() if s.mkt != "bj")
-        can_remove = n_shsz >= 0.9 * old_shsz  # 列表明显不全时不删除任何股票
+        old_bj = sum(1 for s in self.stocks.values() if s.mkt == "bj")
+        can_remove = {"shsz": n_shsz >= 0.9 * old_shsz, "bj": bj_ok and n_bj >= 0.9 * old_bj}
+        removed = []
         for code in list(self.stocks):
-            s = self.stocks[code]
             if code in info:
                 continue
-            if s.mkt == "bj" and not bj_ok:
-                continue
-            if can_remove:
+            if can_remove["bj" if self.stocks[code].mkt == "bj" else "shsz"]:
+                removed.append(f"{code}{self.stocks[code].name}")
                 del self.stocks[code]  # 已退市
+        if removed:
+            self.note(f"剔除已退市 {len(removed)} 只：{'、'.join(removed[:20])}")
+        added = []
         for code, d in info.items():
             s = self.stocks.get(code)
             if s is None:
                 s = self.stocks[code] = Stock(code=code, mkt=d["mkt"])
+                added.append(f"{code}{d['name']}")
             s.mkt = d["mkt"]
             s.name = d["name"] or s.name
             s.list_date = d["list_date"] or s.list_date
             s.is_st = "ST" in s.name.upper()
         self.note(f"股票列表：沪深 {n_shsz} 只，北交所 {len(info) - n_shsz} 只")
+        if added and len(added) < 200:  # 首次构建时全是新增，不逐个列出
+            self.note(f"新上市 {len(added)} 只：{'、'.join(added[:20])}")
 
     # ---------- 全量构建 ----------
     def start_full_build(self) -> None:
