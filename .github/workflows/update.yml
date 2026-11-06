@@ -1,0 +1,99 @@
+name: 更新数据并发布网页
+
+on:
+  schedule:
+    # GitHub 的定时任务用 UTC 时间（北京时间 = UTC + 8），实际触发通常会晚十几到几十分钟
+    - cron: "40 10 * * 1-5" # 北京时间 周一至周五 18:40：每日更新
+    - cron: "40 14 * * 1-5" # 北京时间 周一至周五 22:40：补跑（BaoStock 入库晚时用）
+    - cron: "17 1 * * 6" # 北京时间 周六 09:17：全量重建，纠正可能的累计误差
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "运行模式：daily = 每日更新；rebuild = 全量重建；probe = 只检查数据源"
+        type: choice
+        options: [daily, rebuild, probe]
+        default: daily
+
+permissions:
+  contents: write # 保存计算状态到 data 分支
+  pages: write # 发布网页
+  id-token: write
+
+concurrency:
+  group: update-data
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 确定运行模式
+        id: mode
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_MODE: ${{ inputs.mode }}
+          SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            MODE="$INPUT_MODE"
+          elif [ "$SCHEDULE" = "17 1 * * 6" ]; then
+            MODE=rebuild
+          else
+            MODE=daily
+          fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "运行模式：$MODE"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 检查数据源
+        if: steps.mode.outputs.mode == 'probe'
+        run: python -m bottom probe
+
+      - name: 取回上次的计算状态
+        if: steps.mode.outputs.mode != 'probe'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash scripts/state.sh pull
+
+      - name: 计算
+        if: steps.mode.outputs.mode != 'probe'
+        env:
+          TIME_BUDGET_MIN: "300" # 超过 5 小时就保存进度，下次运行接着做
+          BS_WORKERS: "4" # BaoStock 并行下载进程数
+        run: python -m bottom "${{ steps.mode.outputs.mode }}"
+
+      - name: 保存计算状态
+        if: always() && steps.mode.outputs.mode != 'probe'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash scripts/state.sh push
+
+      - name: 打包网页
+        if: steps.mode.outputs.mode != 'probe'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: update
+    if: needs.update.outputs.mode != 'probe'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: 发布到 GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

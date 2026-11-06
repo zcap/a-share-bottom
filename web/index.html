@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A股 · 距历史最低</title>
+<meta name="description" content="A股全部上市股票：当前股价 / 历史最低价（等比后复权，含发行价）">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <h1>A股 · 距历史最低</h1>
+    <p class="sub">当前股价 ÷ 上市以来最低价（等比后复权，含发行价）</p>
+    <p class="status" id="status">加载中…</p>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="banner" id="banner" hidden></div>
+
+  <section class="controls" aria-label="筛选">
+    <input id="q" type="search" placeholder="搜索代码或名称" autocomplete="off">
+    <div class="chips" id="boards" role="group" aria-label="板块">
+      <button data-board="" class="on">全部</button>
+      <button data-board="沪主板">沪主板</button>
+      <button data-board="深主板">深主板</button>
+      <button data-board="创业板">创业板</button>
+      <button data-board="科创板">科创板</button>
+      <button data-board="北交所">北交所</button>
+    </div>
+    <div class="row">
+      <label>最低价口径
+        <select id="basis">
+          <option value="low">日内最低价</option>
+          <option value="close">收盘价</option>
+        </select>
+      </label>
+      <label class="chk"><input type="checkbox" id="useIssue" checked> 含发行价</label>
+      <label class="chk"><input type="checkbox" id="noST"> 排除 ST</label>
+      <label class="chk"><input type="checkbox" id="noSusp"> 排除停牌</label>
+      <label>比值 ≤ <input id="maxRatio" type="number" min="1" step="0.05" placeholder="不限" inputmode="decimal"></label>
+    </div>
+    <div class="row">
+      <button id="rtBtn" class="primary">获取实时价</button>
+      <label class="chk"><input type="checkbox" id="rtAuto"> 盘中每分钟自动刷新</label>
+      <span class="rt" id="rtStatus"></span>
+      <a class="dl" href="data/latest.csv" download>下载 CSV（收盘数据）</a>
+    </div>
+  </section>
+
+  <section class="buckets" id="buckets" aria-label="分布"></section>
+
+  <div class="tablewrap">
+    <table id="tbl">
+      <thead>
+        <tr>
+          <th data-k="code">代码</th>
+          <th data-k="name">名称</th>
+          <th data-k="board" class="hide-s">板块</th>
+          <th data-k="price" class="num">现价</th>
+          <th data-k="lowNow" class="num hide-s">历史最低<span class="hint">*</span></th>
+          <th data-k="lowDate" class="hide-s">最低日期</th>
+          <th data-k="ratio" class="num sorted asc">比值</th>
+          <th data-k="pct" class="num">距最低</th>
+          <th data-k="ip" class="num hide-m">发行价</th>
+          <th data-k="list_date" class="hide-m">上市日期</th>
+        </tr>
+      </thead>
+      <tbody id="tb"></tbody>
+    </table>
+  </div>
+  <p class="more"><button id="moreBtn" hidden>显示更多</button></p>
+  <p class="note">* 历史最低价已换算成今天的价格口径（相当于等比前复权），可以直接和现价比较。† 发行价由上市首日前收盘价推断。</p>
+
+  <details class="explain">
+    <summary>口径说明</summary>
+    <ul>
+      <li><b>比值</b> = 当前后复权价 ÷ 历史最低后复权价。1.00 表示正处在历史最低，1.50 表示比历史最低高 50%。</li>
+      <li><b>复权</b>：等比后复权（BaoStock 复权因子）。上市首日因子为 1，每次分红、送转、配股后按“前一日收盘价 ÷ 除权除息参考价”累乘。等比复权下，这个比值与用前复权价算出的完全一致，且不会出现负价。</li>
+      <li><b>含发行价</b>：发行价与上市首日处在同一价格口径，直接参与取最小。发行价优先用东方财富新股数据，没有时用上市首日的前收盘价（交易所以发行价作为首日前收盘价）推断。</li>
+      <li><b>最低价口径</b>：“日内最低价”取每天的最低成交价；“收盘价”取每天的收盘价。</li>
+      <li><b>更新</b>：每个交易日晚上自动更新收盘数据；点“获取实时价”会从腾讯行情读取最新价，并把今天的最低价也计入历史最低。</li>
+      <li><b>北交所</b>：BaoStock 不覆盖北交所，北交所数据来自腾讯，复权因子由腾讯的不复权与后复权价相除得到，精度略低。</li>
+    </ul>
+  </details>
+</main>
+
+<footer class="wrap foot">
+  数据来源：BaoStock、腾讯行情、东方财富。仅供参考，不构成投资建议。
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
