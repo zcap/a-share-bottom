@@ -7,7 +7,7 @@ const PAGE = 100;
 const S = {
   data: null, rows: [], view: [], shown: PAGE,
   sortKey: 'ratio', sortDir: 1,
-  board: '', q: '', basis: 'low', useIssue: true, noST: false, noSusp: false, maxRatio: null,
+  board: '', q: '', basis: 'low', useIssue: true, noST: false, noSusp: false, noDelist: false, maxRatio: null,
   rt: {}, rtTime: '', rtBusy: false, rtStale: false, rtTimer: null,
 };
 
@@ -49,7 +49,7 @@ function calc(r) {
   let date = S.basis === 'low' ? dateL : dateC;
   if (S.useIssue && r.issue_price > 0 && r.issue_price < base) { base = r.issue_price; date = '发行价'; }
   r.price = price; r.live = live; r.susp = susp;
-  r.ratio = cur / base; r.pct = (r.ratio - 1) * 100;
+  r.ratio = Math.max(1, cur / base); r.pct = (r.ratio - 1) * 100; // 当前价本身计入了最低，比值不会小于 1
   r.lowNow = base / adj; r.lowDate = date; r.ip = r.issue_price;
 }
 
@@ -68,7 +68,8 @@ function refresh() {
     (!S.board || r.board === S.board) &&
     (!q || r.code.startsWith(q) || r.name.toLowerCase().includes(q)) &&
     (!S.noST || !r.st) &&
-    (!S.noSusp || !r.susp));
+    (!S.noSusp || !r.susp) &&
+    (!S.noDelist || !r.delisting));
   renderBuckets(pre);
   S.view = (S.maxRatio ? pre.filter((r) => r.ratio <= S.maxRatio) : pre).sort(cmp);
   S.shown = PAGE;
@@ -215,11 +216,12 @@ async function load() {
     F.forEach((k, i) => { r[k] = a[i]; });
     r.sym = r.mkt + r.code;
     r.st = !!r.st;
+    r.delisting = /退$|^退市/.test(r.name); // 退市整理期的股票名称以“退”结尾
     return r;
   });
   $('#status').textContent =
     `收盘数据 ${data.market_date} · ${S.rows.length} 只 · 更新于 ${data.updated_at}（北京时间）`;
-  if (data.build_pending) {
+  if (data.build_pending && S.rows.length < data.total) { // 每周校正期间数据完整，不显示
     const b = $('#banner');
     b.hidden = false;
     b.textContent = `数据首次构建尚未完成（已完成 ${S.rows.length} / ${data.total} 只），后续运行会自动补齐。`;
@@ -233,10 +235,12 @@ function bind() {
   S.useIssue = recall('useIssue', true);
   S.noST = recall('noST', false);
   S.noSusp = recall('noSusp', false);
+  S.noDelist = recall('noDelist', false);
   $('#basis').value = S.basis;
   $('#useIssue').checked = S.useIssue;
   $('#noST').checked = S.noST;
   $('#noSusp').checked = S.noSusp;
+  $('#noDelist').checked = S.noDelist;
   $('#rtAuto').checked = recall('rtAuto', false);
   setAuto($('#rtAuto').checked);
 
@@ -249,7 +253,7 @@ function bind() {
     document.querySelectorAll('#boards button').forEach((x) => x.classList.toggle('on', x === b));
     refresh();
   });
-  for (const id of ['basis', 'useIssue', 'noST', 'noSusp']) {
+  for (const id of ['basis', 'useIssue', 'noST', 'noSusp', 'noDelist']) {
     $('#' + id).addEventListener('change', (e) => {
       S[id] = e.target.type === 'checkbox' ? e.target.checked : e.target.value;
       store(id, S[id]);

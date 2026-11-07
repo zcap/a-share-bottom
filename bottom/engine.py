@@ -121,8 +121,9 @@ class Stock:
             if self.issue_price < base_close:
                 base_close, close_date = self.issue_price, "发行价"
         return {
-            "ratio_low": cur / base_low,
-            "ratio_close": cur / base_close,
+            # 当前价本身已计入历史最低，比值理论上不小于 1；这里消除浮点误差
+            "ratio_low": max(1.0, cur / base_low),
+            "ratio_close": max(1.0, cur / base_close),
             # 换算成“今天的价格口径”的历史最低价（相当于等比前复权），方便和现价对照
             "low_now": base_low / self.adj,
             "close_now": base_close / self.adj,
