@@ -170,10 +170,19 @@ class FakeSources:
         idx = [i for i in sorted(s.bars) if i <= e]
         return [s.bars[i] for i in idx], [s.factor[i] for i in idx]
 
-    def fetch_shsz(self, items, end):
+    def factors_shsz(self, code, mkt, end):
+        self.calls.append(("factors", code))
+        s = self.w.stocks[code]
+        e = self.w.cal.index(end)
+        return [(self.w.cal[i], s.factor[i]) for i in sorted(s.events) if i <= e and i in s.factor]
+
+    def fetch_shsz(self, items, end, kind="history"):
         for code, mkt in items:
-            bars, adjs = self.history_shsz(code, mkt, end)
-            yield code, bars, adjs, ""
+            if kind == "factors":
+                yield code, self.factors_shsz(code, mkt, end), None, ""
+            else:
+                bars, adjs = self.history_shsz(code, mkt, end)
+                yield code, bars, adjs, ""
 
     # 北交所 / 腾讯 / 东方财富
     def bj_stock_list(self):

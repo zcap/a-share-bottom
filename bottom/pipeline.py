@@ -1,4 +1,4 @@
-"""更新流程：全量构建（首次 / 每周） + 每日增量。"""
+"""更新流程：全量构建（首次 / 每月） + 每周核对 + 每日增量。"""
 
 from __future__ import annotations
 
@@ -19,6 +19,8 @@ MAX_CATCHUP_DAYS = 15  # 落下超过这么多个交易日就直接全量重建
 CHECKPOINT_EVERY = 300  # 全量构建时每处理这么多只保存一次进度
 EVENT_RATIO_LIMIT = 0.15  # 某天被识别为除权除息的比例超过它，说明数据对不上，放弃当天更新
 EVENT_CHECK_MIN = 50  # 当天有交易的股票少于这个数时不做上面的检查
+COMPLETE_RATIO = 0.95  # BaoStock 全市场单日数据条数达到上市股票数的这个比例，才算当天已入库完整（停牌股也有记录）
+FACTOR_REL_TOL = 2e-4  # 每周核对时，复权因子相对误差超过它就重算
 
 
 class Sources:
@@ -51,8 +53,14 @@ class Sources:
 
         return self.bs.history_with_adj(to_bs_code(code, mkt), end)
 
-    def fetch_shsz(self, items: list[tuple[str, str]], end: str) -> Iterator[tuple]:
-        """并行下载多只沪深股票的完整历史，逐个产出 (代码, bars, adjs, 错误)。"""
+    def factors_shsz(self, code, mkt, end):
+        from .src_baostock import to_bs_code
+
+        return self.bs.adjust_factors(to_bs_code(code, mkt), end)
+
+    def fetch_shsz(self, items: list[tuple[str, str]], end: str, kind: str = "history") -> Iterator[tuple]:
+        """并行下载多只沪深股票，逐个产出 (代码, 数据, adjs, 错误)。
+        kind = history：完整历史日线 + 复权因子；kind = factors：只取复权因子（每周核对用）。"""
         from .src_baostock import _worker_init, worker_fetch
 
         remaining = dict(items)
@@ -61,7 +69,7 @@ class Sources:
             ctx = mp.get_context("spawn")
             with ctx.Pool(self.workers, initializer=_worker_init) as pool:
                 for code, bars, adjs, e in pool.imap_unordered(
-                    worker_fetch, [(c, m, end) for c, m in items], chunksize=4
+                    worker_fetch, [(c, m, end, kind) for c, m in items], chunksize=4
                 ):
                     n += 1
                     if e:
@@ -75,8 +83,11 @@ class Sources:
         # 单进程：worker 数为 1、数量很少、或并行失败后的剩余部分
         for code, mkt in list(remaining.items()):
             try:
-                bars, adjs = self.history_shsz(code, mkt, end)
-                yield code, bars, adjs, ""
+                if kind == "factors":
+                    yield code, self.factors_shsz(code, mkt, end), None, ""
+                else:
+                    bars, adjs = self.history_shsz(code, mkt, end)
+                    yield code, bars, adjs, ""
             except Exception as e:  # noqa: BLE001
                 yield code, None, None, str(e)
 
@@ -180,10 +191,25 @@ class Updater:
             self.note(f"新上市 {len(added)} 只：{'、'.join(added[:20])}")
 
     # ---------- 全量构建 ----------
+    def complete_date(self) -> str:
+        """BaoStock 已经完整入库的最新交易日。
+
+        BaoStock 每天傍晚陆续入库，个别股票已有当天数据不代表全部都有；
+        用全市场单日数据的条数核对，不完整就退回上一个交易日。"""
+        d = self.src.latest_date()
+        listed = sum(1 for s in self.stocks.values() if s.mkt != "bj" and (not s.list_date or s.list_date <= d))
+        n = len(self.src.daily_bars(d))
+        if n >= COMPLETE_RATIO * listed:
+            return d
+        prev = max([x for x in self.src.trade_dates(add_days(d, -20), d) if x < d], default=d)
+        self.note(f"BaoStock {d} 的数据还没入库完整（{n}/{listed}），全量构建截止到 {prev}")
+        return prev
+
     def start_full_build(self) -> None:
         self.meta["build_pending"] = True
         self.meta["build_gen"] = self.today
-        self.meta["build_end"] = self.src.latest_date()
+        self.meta["build_end"] = self.complete_date()
+        self.meta["build_started"] = time.time()
         self.note(f"开始全量构建，数据截止 {self.meta['build_end']}")
 
     def run_full_build(self) -> bool:
@@ -205,7 +231,10 @@ class Updater:
         self.meta["build_pending"] = False
         self.meta["bs_date"] = end
         self.meta["last_full_build"] = gen
-        self.note(f"全量构建完成：沪深 {done} 只（失败 {len(failed)}），北交所 {done_bj} 只（失败 {len(failed_bj)}）")
+        mins = (time.time() - self.meta.get("build_started", time.time())) / 60
+        self.note(f"全量构建完成：沪深 {done} 只（失败 {len(failed)}），北交所 {done_bj} 只（失败 {len(failed_bj)}）"
+                  + (f"，从开始到完成共 {mins / 60:.1f} 小时（含中间等待）" if mins > 1 else ""))
+        self.meta.pop("build_started", None)
         if failed or failed_bj:
             self.note("失败的股票保留旧数据，下次重建时再试：" + ",".join((failed + failed_bj)[:30]))
         return True
@@ -253,11 +282,9 @@ class Updater:
             # BaoStock 还没有这只股票的数据（如刚上市）：标记已处理，等每日更新时再补
             prev.built = gen
             return
-        s = rebuild_from_history(prev, bars, adjs, built=gen)
-        # 查询覆盖到了 end，即使最后几天停牌没有 K 线，也视为已处理到 end
-        if s.last_seen < end:
-            s.last_seen = end
-        self.stocks[code] = s
+        # 注意：不把 last_seen 强行设为 end。如果 BaoStock 当时还没入库这只股票最新一天的数据，
+        # 它的 last_seen 会早于 end，之后的每日更新会把它当作“没跟上进度”重新用完整历史计算
+        self.stocks[code] = rebuild_from_history(prev, bars, adjs, built=gen)
 
     def _rebuild_bj(self, codes, gen) -> tuple[int, list[str]]:
         done, failed = 0, []
@@ -278,6 +305,46 @@ class Updater:
             time.sleep(0.2)
         return done, failed
 
+    # ---------- 每周核对 ----------
+    def run_verify(self) -> None:
+        """每周核对：不重新下载全部历史，只核对每只沪深股票的复权因子。
+
+        后复权价一旦算出就不会再变，所以只要“当前复权因子”和 BaoStock 一致，
+        就说明这期间没有漏掉或算错除权除息；对不上的股票才用完整历史重算。
+        北交所数据量小，直接全部重算。每月第一个周六另做一次完整重建，兜底数据源事后修正历史的情况。"""
+        started = time.time()
+        end = self.meta.get("bs_date")
+        items = [s for s in self.stocks.values() if s.mkt != "bj" and s.has_data() and s.last_seen == end]
+        bad, failed, checked = [], [], 0
+        gen_iter = self.src.fetch_shsz([(s.code, s.mkt) for s in items], end, kind="factors")
+        try:
+            for code, events, _, err in gen_iter:
+                if err or events is None:
+                    failed.append(code)
+                    continue
+                checked += 1
+                s = self.stocks[code]
+                expected = 1.0
+                for d, v in events:
+                    if d <= s.last_seen:
+                        expected = v
+                if abs(expected / s.adj - 1) > FACTOR_REL_TOL:
+                    bad.append(code)
+                    log.warning("%s 复权因子不一致：本地 %.6f，BaoStock %.6f", code, s.adj, expected)
+                if self.out_of_time():
+                    break
+        finally:
+            close = getattr(gen_iter, "close", None)
+            if close:
+                close()
+        self.note(f"每周核对：沪深核对 {checked} 只，复权因子不一致 {len(bad)} 只，查询失败 {len(failed)} 只")
+        if bad:
+            done, f2 = self._rebuild_shsz([(c, self.stocks[c].mkt) for c in bad], end, self.today)
+            self.note(f"每周核对：重算不一致的股票 {done} 只：{'、'.join(bad[:20])}")
+        bj = [s.code for s in self.stocks.values() if s.mkt == "bj"]
+        done_bj, failed_bj = self._rebuild_bj(bj, self.today)
+        self.note(f"每周核对：北交所重算 {done_bj} 只（失败 {len(failed_bj)}），用时 {(time.time() - started) / 60:.0f} 分钟")
+
     # ---------- 每日增量（沪深，BaoStock） ----------
     def daily_shsz(self) -> None:
         last = self.meta.get("bs_date")
@@ -296,7 +363,7 @@ class Updater:
         for d in dates:
             listed = [s for s in self.stocks.values() if s.mkt != "bj" and s.built and (not s.list_date or s.list_date <= d)]
             bars = self.src.daily_bars(d)
-            if len(bars) < 0.8 * len(listed):
+            if len(bars) < COMPLETE_RATIO * len(listed):
                 self.note(f"沪深：BaoStock 还没有 {d} 的完整数据（{len(bars)} 条），下次运行再更新")
                 break
             try:
@@ -398,6 +465,8 @@ class Updater:
             if not self.run_full_build():
                 return
             self.daily_shsz()
+        if mode == "verify":
+            self.run_verify()
         self.daily_bj()
         self.update_issue_prices()
         self.meta["updated_at"] = bj_now().strftime("%Y-%m-%d %H:%M")

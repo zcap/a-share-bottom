@@ -5,14 +5,14 @@ on:
     # GitHub 的定时任务用 UTC 时间（北京时间 = UTC + 8），实际触发通常会晚十几到几十分钟
     - cron: "40 10 * * 1-5" # 北京时间 周一至周五 18:40：每日更新
     - cron: "40 14 * * 1-5" # 北京时间 周一至周五 22:40：补跑（BaoStock 入库晚时用）
-    - cron: "17 1 * * 6" # 北京时间 周六 09:17：全量重建，纠正可能的累计误差
-    - cron: "17 1 * * 0" # 北京时间 周日 09:17：接着完成周六没跑完的全量重建（已完成则什么也不做）
+    - cron: "17 1 * * 6" # 北京时间 周六 09:17：每周核对复权因子（约 1 小时）；每月第一个周六改为完整重建
+    - cron: "17 1 * * 0" # 北京时间 周日 09:17：接着完成周六没跑完的完整重建（已完成则什么也不做）
   workflow_dispatch:
     inputs:
       mode:
-        description: "运行模式：daily = 每日更新；rebuild = 全量重建；probe = 只检查数据源"
+        description: "运行模式：daily = 每日更新；verify = 每周核对；rebuild = 完整重建；probe = 只检查数据源"
         type: choice
-        options: [daily, rebuild, probe]
+        options: [daily, verify, rebuild, probe]
         default: daily
 
 permissions:
@@ -43,7 +43,8 @@ jobs:
           if [ "$EVENT" = "workflow_dispatch" ]; then
             MODE="$INPUT_MODE"
           elif [ "$SCHEDULE" = "17 1 * * 6" ]; then
-            MODE=rebuild
+            # 每月第一个周六（北京时间 1～7 日）完整重建，其余周六只核对复权因子
+            if [ "$(TZ=Asia/Shanghai date +%-d)" -le 7 ]; then MODE=rebuild; else MODE=verify; fi
           else
             MODE=daily
           fi

@@ -110,7 +110,8 @@ class BaoStock:
         cols, rows = self._query(
             bs.query_history_k_data_plus,
             bs_code,
-            "date,open,high,low,close,preclose,volume,tradestatus",
+            # 计算只用到最低价、收盘价、前收盘价；不取开盘价和最高价，下载量少约四分之一
+            "date,low,close,preclose,volume,tradestatus",
             start_date=HIST_START,
             end_date=end,
             frequency="d",
@@ -211,13 +212,18 @@ def _worker_init() -> None:
         _worker_api = None
 
 
-def worker_fetch(args: tuple[str, str, str]):
-    """返回 (代码, bars, adjs, 错误信息)。在子进程里运行。"""
+def worker_fetch(args: tuple[str, str, str, str]):
+    """在子进程里运行。
+    kind = history：返回 (代码, bars, adjs, 错误信息)
+    kind = factors：返回 (代码, [(除权日, 后复权因子)], None, 错误信息)
+    """
     global _worker_api
-    code, mkt, end = args
+    code, mkt, end, kind = args
     try:
         if _worker_api is None:
             _worker_api = BaoStock()
+        if kind == "factors":
+            return code, _worker_api.adjust_factors(to_bs_code(code, mkt), end), None, ""
         bars, adjs = _worker_api.history_with_adj(to_bs_code(code, mkt), end)
         return code, bars, adjs, ""
     except Exception as e:  # noqa: BLE001

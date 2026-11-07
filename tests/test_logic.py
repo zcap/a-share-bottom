@@ -94,7 +94,10 @@ def test_baostock_lag(world, tmp_path):
     check_truth(world, up.stocks, 31)
 
 
-def test_missing_bar_triggers_rebuild(world, tmp_path):
+def test_missing_bar_triggers_rebuild(world, tmp_path, monkeypatch):
+    # 模拟市场只有 6 只沪深股票，缺 1 只就低于“入库完整”的 95%；这里放宽，专门测缺数据的处理
+    import bottom.pipeline as pl
+    monkeypatch.setattr(pl, "COMPLETE_RATIO", 0.8)
     d = str(tmp_path)
     run_day(world, 95, d)
     for i in range(96, 101):
@@ -231,3 +234,64 @@ def test_universe_new_and_delisted():
     up2 = Updater(Src(base[:10], []), dict(up.stocks), {}, today="2024-03-05")
     up2.refresh_universe()
     assert before <= set(up2.stocks)  # 北交所列表为空也不删
+
+
+def test_weekly_verify_rebuilds_only_mismatched(world, tmp_path):
+    """每周核对：复权因子对得上的不动，对不上的用完整历史重算。"""
+    d = str(tmp_path)
+    run_day(world, 110, d)
+    for i in range(111, 122):
+        run_day(world, i, d)
+    stocks, meta = store.load(d)
+    # 模拟某次漏掉除权：本地因子整体偏了 1%
+    stocks["000002"].adj *= 1.01
+    stocks["000002"].last_adj *= 1.01
+    store.save(stocks, meta, d)
+    up, src = run_day(world, 121, d, mode="verify")
+    hist = {c for k, c in src.calls if k == "history"}
+    assert hist == {"000002"}, hist
+    assert {c for k, c in src.calls if k == "factors"} >= {"600001", "000002", "300003"}
+    assert ("bj_history", "920007") in src.calls  # 北交所直接重算
+    check_truth(world, up.stocks, 121)
+
+
+def test_build_end_waits_for_complete_ingestion(world, tmp_path):
+    """BaoStock 当天只入库了一部分：全量构建截止到上一个交易日，之后再补。"""
+    d = str(tmp_path)
+
+    class Partial(FakeSources):
+        def daily_bars(self, date):
+            out = super().daily_bars(date)
+            if date == self.today:
+                out = dict(list(out.items())[:2])
+            return out
+
+    stocks, meta = store.load(d)
+    up = Updater(Partial(world, 40), stocks, meta, today=world.cal[40], now_hm="20:00")
+    up.run("daily")
+    store.save(up.stocks, up.meta, d)
+    assert up.meta["bs_date"] == world.cal[39]
+    up, _ = run_day(world, 40, d)  # 入库完整后补上当天
+    assert up.meta["bs_date"] == world.cal[40]
+    check_truth(world, up.stocks, 40)
+
+
+def test_stock_missing_latest_bar_heals(world, tmp_path):
+    """全量构建时某只股票最新一天还没入库：不强行标记为已处理，下次运行自动补算。"""
+    d = str(tmp_path)
+
+    class Lagging(FakeSources):
+        def history_shsz(self, code, mkt, end):
+            bars, adjs = super().history_shsz(code, mkt, end)
+            if code == "000002" and bars and bars[-1].date == end:
+                bars, adjs = bars[:-1], adjs[:-1]
+            return bars, adjs
+
+    stocks, meta = store.load(d)
+    up = Updater(Lagging(world, 50), stocks, meta, today=world.cal[50], now_hm="20:00")
+    up.run("daily")
+    store.save(up.stocks, up.meta, d)
+    assert up.stocks["000002"].last_seen == world.cal[49]
+    up, src = run_day(world, 51, d)
+    assert ("history", "000002") in src.calls
+    check_truth(world, up.stocks, 51)
