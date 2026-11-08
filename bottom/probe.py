@@ -149,5 +149,5 @@ def probe() -> int:
     if bad_other:
         summary(f"部分数据源不可用：{'、'.join(bad_other)}。沪深数据不受影响，相关功能会降级。")
     else:
-        summary("全部正常，可以运行 rebuild 做首次全量构建。")
+        summary("全部正常。（首次部署时运行 rebuild 做全量构建，之后日常运行 daily 即可。）")
     return 0

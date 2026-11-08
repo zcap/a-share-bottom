@@ -239,18 +239,19 @@ async function load() {
     const part = (label, v, d, u = '') => `${label} ${isNum(v) ? v.toFixed(d) + u : '—'}`;
     const ind = r.industry ? `与「${r.industry}」行业内比较` : '无行业信息，与全市场比较';
     const fp = r.fin_period ? `${r.fin_period} 财报` : '';
+    const noScore = r.delisting ? '退市整理期，不参与评分' : null;
     r.valTip = isNum(r.vscore)
       ? `${part('市盈率TTM', r.pe, 1)} · ${part('市净率', r.pb, 2)} · ${part('市销率TTM', r.ps, 2)}（${r.val_date}）\n${ind}`
-      : '估值数据不足，暂无价值分';
+      : (noScore || '估值数据不足，暂无价值分');
     r.qualTip = isNum(r.qscore)
       ? `${part('净资产收益率', r.roe, 1, '%')} · ${part('毛利率', r.gpm, 1, '%')} · ${part('经营现金流/净资产', r.cfroe, 1, '%')}（${fp}）\n${ind}`
-      : '没有可比的财务数据，暂无质量分';
+      : (noScore || '没有可比的财务数据，暂无质量分');
     r.growTip = isNum(r.gscore)
       ? `${part('营收同比', r.rev_yoy, 1, '%')} · ${part('净利润同比', r.np_yoy, 1, '%')}（${fp}）\n${ind}`
-      : '没有可比的财务数据，暂无成长分';
+      : (noScore || '没有可比的财务数据，暂无成长分');
     r.totTip = isNum(r.tscore)
       ? `价值 ${Math.round(r.vscore)} × 50% + 质量 ${Math.round(r.qscore)} × 30% + 成长 ${Math.round(r.gscore)} × 20%\n${ind}`
-      : '价值、质量、成长三项分数不全，暂无综合分';
+      : (noScore || '价值、质量、成长三项分数不全，暂无综合分');
     return r;
   });
   $('#status').textContent =

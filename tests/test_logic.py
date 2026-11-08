@@ -512,3 +512,14 @@ def test_rebuild_keeps_valuation_industry_financials(world, tmp_path):
     for c, s in up2.stocks.items():
         assert (s.pe, s.industry, s.roe, s.fin_period) == before[c] or math.isnan(before[c][0])
     assert up2.stocks["000002"].industry == "银行" and math.isfinite(up2.stocks["000002"].roe)
+
+
+def test_delisting_stocks_not_scored():
+    from bottom.engine import compute_scores, is_delisting
+    assert is_delisting("萃华退") and is_delisting("退市海润") and not is_delisting("*ST岭南") and not is_delisting("退婴科技")
+    ss = [_st(f"60{i:04d}", "化工", pe=10 + i, pb=1 + i / 10, ps=1 + i / 10) for i in range(10)]
+    ss.append(_st("002731", "化工", pe=0.2, pb=0.03, ps=0.05))
+    ss[-1].name = "萃华退"
+    sc = compute_scores(ss)
+    assert "002731" not in sc
+    assert sc["600000"]["value"] == pytest.approx(100)  # 最便宜的正常股票仍是 100 分，没被退市股挤掉

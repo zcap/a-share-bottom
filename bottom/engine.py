@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, fields
 
 # 价格精度是 0.01 元，差值达到半分钱就认为不同
@@ -290,12 +291,19 @@ def _percentiles(items: list[tuple[float, str]]) -> dict[str, float]:
     return out
 
 
+def is_delisting(name: str) -> bool:
+    """退市整理期：名称以“退”结尾（如“萃华退”），或旧规则下以“退市”开头。"""
+    n = (name or "").strip()
+    return bool(re.search(r"退$|^退市", n))
+
+
 def compute_scores(stocks) -> dict[str, dict[str, float]]:
     """{代码: {value, quality, growth, total}}，各项 0–100，越高越好；缺的项不出现。
 
     同行业内比较，避免银行、地产这类天然低估值的行业永远“便宜”；
-    行业太小或没有行业信息时，改为和全市场比较。"""
-    stocks = [s for s in stocks if s.has_data()]
+    行业太小或没有行业信息时，改为和全市场比较。
+    退市整理期的股票不参与评分：股价已经崩塌，估值指标失去意义，也不占同行业的排名。"""
+    stocks = [s for s in stocks if s.has_data() and not is_delisting(s.name)]
     pct: dict[str, dict[str, float]] = {}
     metrics = {m for ms, _ in SCORE_DEFS.values() for m in ms}
     for m in metrics:
