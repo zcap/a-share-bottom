@@ -120,7 +120,25 @@ def probe() -> int:
             raise RuntimeError("没有取到数据（将改用上市首日前收盘价推断发行价）")
         return f"{len(p)} 只", p
 
-    _check("东方财富发行价", ipo, False, results)
+    _check("东方财富发行价（失败时改用首日前收盘价推断）", ipo, False, results)
+
+    def fin():
+        import time as _t
+
+        from .engine import fin_period
+        from .src_other import financials
+
+        p = fin_period(today)
+        t0 = _t.time()
+        rows = financials(p)
+        if not rows:
+            raise RuntimeError(f"{p} 报告期没有数据")
+        m = {r["code"]: r for r in rows}.get("600519", {})
+        sample = (f"贵州茅台：行业 {m.get('industry', '—')}，每股净资产 {m.get('bps')}，净资产收益率 {m.get('roe')}%，"
+                  f"毛利率 {m.get('gpm')}%，营收同比 {m.get('rev_yoy')}%，净利润同比 {m.get('np_yoy')}%") if m else "没有贵州茅台"
+        return f"{p} 报告期 {len(rows)} 只（用时 {_t.time() - t0:.0f} 秒）；{sample}", rows
+
+    _check("东方财富业绩报表（质量分、成长分、行业）", fin, False, results)
 
     bad_critical = [n for n, ok, c in results if not ok and c]
     bad_other = [n for n, ok, c in results if not ok and not c]

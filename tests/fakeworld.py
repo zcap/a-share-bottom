@@ -155,8 +155,35 @@ class FakeSources:
         for s in self.w.stocks.values():
             if s.mkt == "bj" or i not in s.bars or (s.code, i) in self.drop:
                 continue
-            out[s.code] = (s.mkt, s.bars[i], False)
+            out[s.code] = (s.mkt, s.bars[i], False, self.valuation(s, i))
         return out
+
+    # 每股收益、每股净资产、每股销售额（模拟）；688004 亏损
+    FUND = {"600001": (0.3, 2.0, 1.5), "000002": (0.8, 6.0, 9.0), "300003": (1.0, 5.0, 4.0),
+            "688004": (-2.0, 30.0, 10.0), "002005": (-0.1, 1.0, 3.0), "601006": (0.5, 4.0, 6.0),
+            "920007": (0.6, 5.0, 7.0)}
+
+    INDUSTRY = {"600001": "银行", "000002": "银行", "300003": "电子", "688004": "电子",
+                "002005": "化工", "601006": "化工", "920007": "电子"}
+
+    def financials(self, period):
+        self.calls.append(("financials", period))
+        out = []
+        for s in self.w.stocks.values():
+            if s.list_idx > self.today_idx:
+                continue
+            e, bv, sp = self.FUND[s.code]
+            out.append({"code": s.code, "industry": self.INDUSTRY[s.code], "bps": bv, "roe": e / bv * 100,
+                        "gpm": math.nan if self.INDUSTRY[s.code] == "银行" else 25.0 + bv,
+                        "ocfps": e * 1.1, "rev_yoy": 10.0 * e, "np_yoy": 20.0 * e})
+        return out
+
+    def valuation(self, s, i):
+        b = s.bars[i]
+        if not b.traded:
+            return (math.nan, math.nan, math.nan)
+        e, bv, sp = self.FUND[s.code]
+        return (b.close / e, b.close / bv, b.close / sp)
 
     def daily_factors(self, date):
         i = self.w.cal.index(date)

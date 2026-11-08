@@ -7,13 +7,21 @@ const PAGE = 100;
 const S = {
   data: null, rows: [], view: [], shown: PAGE,
   sortKey: 'ratio', sortDir: 1,
-  board: '', q: '', basis: 'low', useIssue: true, noST: false, noSusp: false, noDelist: false, maxRatio: null,
+  board: '', q: '', basis: 'low', useIssue: true, noST: false, noSusp: false, noDelist: false, maxRatio: null, minScore: null, scoreKey: 'tscore',
   rt: {}, rtTime: '', rtBusy: false, rtStale: false, rtTimer: null,
 };
 
 // ---------- 工具 ----------
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const fmtP = (x) => (x > 0 && isFinite(x) ? x.toFixed(x < 1 ? 3 : 2) : '—');
+const isNum = (x) => typeof x === 'number' && isFinite(x);
+const fmtPE = (x) => (!isNum(x) ? '<span class="dim">—</span>' : x < 0 ? '<span class="dim">亏损</span>' : x.toFixed(1));
+const fmtPB = (x) => (!isNum(x) ? '<span class="dim">—</span>' : x < 0 ? '<span class="dim">资不抵债</span>' : x.toFixed(2));
+function scoreCell(r, k, tip, cls) {
+  const v = r[k];
+  return `<td class="num score${isNum(v) && v >= 80 ? ' good' : ''}${cls}" title="${esc(tip)}">${isNum(v) ? Math.round(v) : '<span class="dim">—</span>'}</td>`;
+}
+const DESC_FIRST = new Set(['tscore', 'vscore', 'qscore', 'gscore']); // 第一次点击就从高到低排
 function bjNow() {
   const d = new Date(Date.now() + 8 * 3600 * 1000); // 用 UTC 字段读出北京时间
   return { day: d.getUTCDay(), hm: d.toISOString().slice(11, 16) };
@@ -71,7 +79,9 @@ function refresh() {
     (!S.noSusp || !r.susp) &&
     (!S.noDelist || !r.delisting));
   renderBuckets(pre);
-  S.view = (S.maxRatio ? pre.filter((r) => r.ratio <= S.maxRatio) : pre).sort(cmp);
+  S.view = pre.filter((r) =>
+    (!S.maxRatio || r.ratio <= S.maxRatio) &&
+    (S.minScore === null || (isNum(r[S.scoreKey]) && r[S.scoreKey] >= S.minScore))).sort(cmp);
   S.shown = PAGE;
   renderTable();
 }
@@ -93,18 +103,24 @@ function renderTable() {
     const w = Math.max(2, Math.min(60, (60 * Math.log(r.ratio)) / Math.log(5)));
     return `<tr>
 <td><a href="https://gu.qq.com/${r.sym}" target="_blank" rel="noopener">${r.code}</a></td>
-<td>${esc(r.name)}${r.susp ? '<span class="tag">停牌</span>' : ''}</td>
-<td class="hide-s dim">${r.board}</td>
+<td title="${esc(r.industry || '')}">${esc(r.name)}${r.susp ? '<span class="tag">停牌</span>' : ''}</td>
+<td class="hide-m dim">${r.board}</td>
 <td class="num${r.live ? ' live' : ''}">${fmtP(r.price)}</td>
 <td class="num hide-s">${fmtP(r.lowNow)}</td>
 <td class="hide-s dim">${esc(r.lowDate)}</td>
 <td class="num ratio${r.ratio <= 1.1 ? ' hot' : ''}">${r.ratio.toFixed(3)}</td>
-<td class="num"><span class="pct"><span class="track"><i style="width:${w.toFixed(0)}px"></i></span><em>${r.pct.toFixed(1)}%</em></span></td>
-<td class="num hide-m">${r.ip > 0 ? fmtP(r.ip) + (r.issue_src === 'infer' ? '<span class="hint">†</span>' : '') : '<span class="dim">—</span>'}</td>
-<td class="hide-m dim">${r.list_date || ''}</td>
+<td class="num hide-s"><span class="pct"><span class="track"><i style="width:${w.toFixed(0)}px"></i></span><em>${r.pct.toFixed(1)}%</em></span></td>
+${scoreCell(r, 'tscore', r.totTip, '')}
+${scoreCell(r, 'vscore', r.valTip, ' hide-s')}
+${scoreCell(r, 'qscore', r.qualTip, ' hide-s')}
+${scoreCell(r, 'gscore', r.growTip, ' hide-s')}
+<td class="num hide-m">${fmtPE(r.pe)}</td>
+<td class="num hide-m">${fmtPB(r.pb)}</td>
+<td class="num hide-l">${r.ip > 0 ? fmtP(r.ip) + (r.issue_src === 'infer' ? '<span class="hint">†</span>' : '') : '<span class="dim">—</span>'}</td>
+<td class="hide-l dim">${r.list_date || ''}</td>
 </tr>`;
   }).join('');
-  $('#tb').innerHTML = html || '<tr><td colspan="10" class="dim">没有符合条件的股票</td></tr>';
+  $('#tb').innerHTML = html || '<tr><td colspan="16" class="dim">没有符合条件的股票</td></tr>';
   const btn = $('#moreBtn');
   btn.hidden = S.view.length <= S.shown;
   btn.textContent = `显示更多（还有 ${S.view.length - S.shown} 只）`;
@@ -217,6 +233,24 @@ async function load() {
     r.sym = r.mkt + r.code;
     r.st = !!r.st;
     r.delisting = /退$|^退市/.test(r.name); // 退市整理期的股票名称以“退”结尾
+    // 市盈率、市净率排序：亏损/资不抵债排在最后
+    r.peSort = isNum(r.pe) ? (r.pe > 0 ? r.pe : 1e12) : null;
+    r.pbSort = isNum(r.pb) ? (r.pb > 0 ? r.pb : 1e12) : null;
+    const part = (label, v, d, u = '') => `${label} ${isNum(v) ? v.toFixed(d) + u : '—'}`;
+    const ind = r.industry ? `与「${r.industry}」行业内比较` : '无行业信息，与全市场比较';
+    const fp = r.fin_period ? `${r.fin_period} 财报` : '';
+    r.valTip = isNum(r.vscore)
+      ? `${part('市盈率TTM', r.pe, 1)} · ${part('市净率', r.pb, 2)} · ${part('市销率TTM', r.ps, 2)}（${r.val_date}）\n${ind}`
+      : '估值数据不足，暂无价值分';
+    r.qualTip = isNum(r.qscore)
+      ? `${part('净资产收益率', r.roe, 1, '%')} · ${part('毛利率', r.gpm, 1, '%')} · ${part('经营现金流/净资产', r.cfroe, 1, '%')}（${fp}）\n${ind}`
+      : '没有可比的财务数据，暂无质量分';
+    r.growTip = isNum(r.gscore)
+      ? `${part('营收同比', r.rev_yoy, 1, '%')} · ${part('净利润同比', r.np_yoy, 1, '%')}（${fp}）\n${ind}`
+      : '没有可比的财务数据，暂无成长分';
+    r.totTip = isNum(r.tscore)
+      ? `价值 ${Math.round(r.vscore)} × 50% + 质量 ${Math.round(r.qscore)} × 30% + 成长 ${Math.round(r.gscore)} × 20%\n${ind}`
+      : '价值、质量、成长三项分数不全，暂无综合分';
     return r;
   });
   $('#status').textContent =
@@ -265,6 +299,12 @@ function bind() {
     S.maxRatio = v > 0 ? v : null;
     refresh();
   });
+  $('#scoreKey').addEventListener('change', (e) => { S.scoreKey = e.target.value; refresh(); });
+  $('#minScore').addEventListener('input', (e) => {
+    const v = parseFloat(e.target.value);
+    S.minScore = v >= 0 ? v : null;
+    refresh();
+  });
   $('#buckets').addEventListener('click', (e) => {
     const b = e.target.closest('button');
     if (!b) return;
@@ -281,7 +321,7 @@ function bind() {
     if (!th) return;
     const k = th.dataset.k;
     if (S.sortKey === k) S.sortDir = -S.sortDir;
-    else { S.sortKey = k; S.sortDir = 1; }
+    else { S.sortKey = k; S.sortDir = DESC_FIRST.has(k) ? -1 : 1; }
     S.view.sort(cmp);
     renderTable();
   });

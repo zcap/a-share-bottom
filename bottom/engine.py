@@ -62,6 +62,18 @@ class Stock:
     min_close_date: str = ""
     built: str = ""  # 最近一次用完整历史重算的日期
     n_events: int = 0  # 除权除息次数
+    pe: float = math.nan  # 市盈率（TTM）
+    pb: float = math.nan  # 市净率（MRQ）
+    ps: float = math.nan  # 市销率（TTM）
+    val_date: str = ""  # 估值数据日期
+    industry: str = ""  # 所处行业（东方财富行业分类）
+    roe: float = math.nan  # 净资产收益率 %（报告期累计）
+    gpm: float = math.nan  # 销售毛利率 %
+    ocfps: float = math.nan  # 每股经营现金流
+    bps: float = math.nan  # 每股净资产
+    rev_yoy: float = math.nan  # 营业总收入同比 %
+    np_yoy: float = math.nan  # 净利润同比 %
+    fin_period: str = ""  # 财务数据所属报告期
 
     # ---------- 序列化 ----------
     @classmethod
@@ -180,19 +192,19 @@ def apply_bar(s: Stock, bar: Bar, adj: float | None = None) -> str:
     return "event" if event else "ok"
 
 
+# 完整重算时保留的字段（与价格历史无关）
+KEEP_ON_REBUILD = (
+    "name", "list_date", "is_st", "issue_price", "issue_src",
+    "pe", "pb", "ps", "val_date",
+    "industry", "roe", "gpm", "ocfps", "bps", "rev_yoy", "np_yoy", "fin_period",
+)
+
+
 def rebuild_from_history(
     prev: Stock, bars: list[Bar], adjs: list[float | None] | None, built: str
 ) -> Stock:
-    """用完整历史从头重算一只股票。保留基本信息和已知的发行价。"""
-    s = Stock(
-        code=prev.code,
-        mkt=prev.mkt,
-        name=prev.name,
-        list_date=prev.list_date,
-        is_st=prev.is_st,
-        issue_price=prev.issue_price,
-        issue_src=prev.issue_src,
-    )
+    """用完整历史从头重算一只股票。只重算价格相关的字段；基本信息、发行价、估值、行业、财务数据原样保留。"""
+    s = Stock(code=prev.code, mkt=prev.mkt, **{k: getattr(prev, k) for k in KEEP_ON_REBUILD})
     if adjs is None:
         adjs = [None] * len(bars)
     for bar, a in zip(bars, adjs):
@@ -229,3 +241,106 @@ def is_a_share(code: str, mkt: str) -> bool:
     if mkt == "bj":
         return True
     return code.startswith(A_SHARE_PREFIX.get(mkt, ()))
+
+
+# ---------------- 评分：价值 / 质量 / 成长 / 综合 ----------------
+# 每个分数由几个指标组成，指标都换成“越大越好”，在同行业内排名换成百分位后取平均。
+SCORE_DEFS = {
+    # 价值：市盈率、市净率、市销率取倒数（盈利收益率、账面市值比、销售市值比）。
+    # 取倒数后亏损、资不抵债会自然排到最差，而不是被当成“市盈率很低”。
+    "value": (("ep", "bp", "sp"), 2),
+    # 质量：净资产收益率、销售毛利率、经营现金流/净资产（利润有没有真金白银）
+    "quality": (("roe", "gpm", "cfroe"), 2),
+    # 成长：营业收入同比、净利润同比
+    "growth": (("rev_yoy", "np_yoy"), 1),
+}
+TOTAL_WEIGHTS = {"value": 0.5, "quality": 0.3, "growth": 0.2}
+MIN_GROUP = 8  # 同行业里有这个指标的股票少于它时，改为和全市场比较
+
+
+def _fin(v) -> float:
+    return float(v) if isinstance(v, (int, float)) and math.isfinite(v) else math.nan
+
+
+def metric_value(s: "Stock", name: str) -> float:
+    """指标值（越大越好）；缺失返回 nan。"""
+    if name in ("ep", "bp", "sp"):
+        v = _fin({"ep": s.pe, "bp": s.pb, "sp": s.ps}[name])
+        return 1.0 / v if math.isfinite(v) and v != 0 else math.nan
+    if name == "cfroe":
+        return s.ocfps / s.bps if is_pos(s.bps) and math.isfinite(_fin(s.ocfps)) else math.nan
+    return _fin(getattr(s, name))
+
+
+def _percentiles(items: list[tuple[float, str]]) -> dict[str, float]:
+    """[(值, 代码)] → {代码: 0～1 的百分位}，并列取平均名次。"""
+    n = len(items)
+    if n < 2:
+        return {}
+    items = sorted(items)
+    out, i = {}, 0
+    while i < n:
+        j = i
+        while j + 1 < n and items[j + 1][0] == items[i][0]:
+            j += 1
+        p = ((i + j) / 2) / (n - 1)
+        for t in range(i, j + 1):
+            out[items[t][1]] = p
+        i = j + 1
+    return out
+
+
+def compute_scores(stocks) -> dict[str, dict[str, float]]:
+    """{代码: {value, quality, growth, total}}，各项 0–100，越高越好；缺的项不出现。
+
+    同行业内比较，避免银行、地产这类天然低估值的行业永远“便宜”；
+    行业太小或没有行业信息时，改为和全市场比较。"""
+    stocks = [s for s in stocks if s.has_data()]
+    pct: dict[str, dict[str, float]] = {}
+    metrics = {m for ms, _ in SCORE_DEFS.values() for m in ms}
+    for m in metrics:
+        allv, groups = [], {}
+        for s in stocks:
+            v = metric_value(s, m)
+            if math.isfinite(v):
+                allv.append((v, s.code))
+                if s.industry:
+                    groups.setdefault(s.industry, []).append((v, s.code))
+        market = _percentiles(allv)
+        for code, p in market.items():
+            pct.setdefault(code, {})[m] = p
+        for items in groups.values():
+            if len(items) >= MIN_GROUP:
+                for code, p in _percentiles(items).items():
+                    pct[code][m] = p
+    out: dict[str, dict[str, float]] = {}
+    for code, d in pct.items():
+        sc = {}
+        for name, (ms, need) in SCORE_DEFS.items():
+            vals = [d[m] for m in ms if m in d]
+            if len(vals) >= need:
+                sc[name] = 100.0 * sum(vals) / len(vals)
+        if all(k in sc for k in TOTAL_WEIGHTS):
+            sc["total"] = sum(sc[k] * w for k, w in TOTAL_WEIGHTS.items())
+        if sc:
+            out[code] = sc
+    return out
+
+
+def value_scores(stocks) -> dict[str, float]:
+    """只取价值分（0–100，越高越便宜）。"""
+    return {c: d["value"] for c, d in compute_scores(stocks).items() if "value" in d}
+
+
+def fin_period(today: str) -> str:
+    """当前应该使用的财报期：所有公司都已过披露截止日的最近一期，保证全市场用同一期比较。
+
+    一季报 4/30、半年报 8/31、三季报 10/31、年报次年 4/30 截止；留 3 天给数据源整理。"""
+    y, md = int(today[:4]), today[5:]
+    if md >= "11-04":
+        return f"{y}-09-30"
+    if md >= "09-04":
+        return f"{y}-06-30"
+    if md >= "05-04":
+        return f"{y}-03-31"
+    return f"{y - 1}-09-30"

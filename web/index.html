@@ -41,6 +41,12 @@
       <label class="chk"><input type="checkbox" id="noSusp"> 排除停牌</label>
       <label class="chk"><input type="checkbox" id="noDelist"> 排除退市整理</label>
       <label>比值 ≤ <input id="maxRatio" type="number" min="1" step="0.05" placeholder="不限" inputmode="decimal"></label>
+      <label><select id="scoreKey" aria-label="分数类型">
+          <option value="tscore">综合分</option>
+          <option value="vscore">价值分</option>
+          <option value="qscore">质量分</option>
+          <option value="gscore">成长分</option>
+        </select> ≥ <input id="minScore" type="number" min="0" max="100" step="5" placeholder="不限" inputmode="numeric"></label>
     </div>
     <div class="row">
       <button id="rtBtn" class="primary">获取实时价</button>
@@ -58,14 +64,20 @@
         <tr>
           <th data-k="code">代码</th>
           <th data-k="name">名称</th>
-          <th data-k="board" class="hide-s">板块</th>
+          <th data-k="board" class="hide-m">板块</th>
           <th data-k="price" class="num">现价</th>
           <th data-k="lowNow" class="num hide-s">历史最低<span class="hint">*</span></th>
           <th data-k="lowDate" class="hide-s">最低日期</th>
           <th data-k="ratio" class="num sorted asc">比值</th>
-          <th data-k="pct" class="num">距最低</th>
-          <th data-k="ip" class="num hide-m">发行价</th>
-          <th data-k="list_date" class="hide-m">上市日期</th>
+          <th data-k="pct" class="num hide-s">距最低</th>
+          <th data-k="tscore" class="num" title="价值 50% + 质量 30% + 成长 20%，0–100">综合</th>
+          <th data-k="vscore" class="num hide-s" title="同行业内比较，越高越便宜">价值</th>
+          <th data-k="qscore" class="num hide-s" title="同行业内比较：净资产收益率、毛利率、经营现金流/净资产">质量</th>
+          <th data-k="gscore" class="num hide-s" title="同行业内比较：营收同比、净利润同比">成长</th>
+          <th data-k="peSort" class="num hide-m">市盈率</th>
+          <th data-k="pbSort" class="num hide-m">市净率</th>
+          <th data-k="ip" class="num hide-l">发行价</th>
+          <th data-k="list_date" class="hide-l">上市日期</th>
         </tr>
       </thead>
       <tbody id="tb"></tbody>
@@ -82,13 +94,20 @@
       <li><b>含发行价</b>：发行价与上市首日处在同一价格口径，直接参与取最小。发行价优先用东方财富新股数据，没有时用上市首日的前收盘价（交易所以发行价作为首日前收盘价）推断。</li>
       <li><b>最低价口径</b>：“日内最低价”取每天的最低成交价；“收盘价”取每天的收盘价。</li>
       <li><b>更新</b>：每个交易日晚上自动更新收盘数据；点“获取实时价”会从腾讯行情读取最新价，并把今天的最低价也计入历史最低。</li>
+      <li><b>四个分数</b>都是 0–100，越高越好，都在<b>同行业内</b>比较（东方财富行业分类；同行业不足 8 只时改为和全市场比较），所以银行不会因为行业整体估值低就总是高分。把鼠标停在分数上可以看到原始指标。</li>
+      <li><b>价值分</b>：市盈率（TTM）、市净率、市销率（TTM）分别取倒数，在同行业排名换成百分位后取平均；亏损、资不抵债的在对应指标上排最差。至少两项才给分（北交所没有市销率）。</li>
+      <li><b>质量分</b>：净资产收益率、销售毛利率、经营现金流 ÷ 净资产（利润有没有真金白银），同样排名取平均；至少两项才给分（银行等没有毛利率的用另外两项）。</li>
+      <li><b>成长分</b>：营业收入同比、净利润同比。</li>
+      <li><b>综合分</b> = 价值 × 50% + 质量 × 30% + 成长 × 20%，三项都有才给分。看分项可以分辨“便宜是因为好”还是“便宜是因为差”：价值分高但质量分很低，往往是有原因的便宜。</li>
+      <li><b>财报期</b>：全市场统一用所有公司都已过披露截止日的最近一期（一季报 4/30、半年报 8/31、三季报 10/31、年报次年 4/30 截止），保证可比；所以年报季前后会有几个月的滞后。季报指标是年初至今累计数，同一期之间可比。</li>
+      <li><b>仍然要注意</b>：分数只反映已公布的财务数据和当前估值，不包含行业前景、管理层、一次性损益等信息；周期行业在景气高点时往往估值低、质量分高。分数按每天收盘数据计算，盘中不随实时价变化。</li>
       <li><b>北交所</b>：BaoStock 不覆盖北交所，北交所数据来自腾讯，复权因子由腾讯的不复权与后复权价相除得到，精度略低。</li>
     </ul>
   </details>
 </main>
 
 <footer class="wrap foot">
-  数据来源：BaoStock、腾讯行情、东方财富。仅供参考，不构成投资建议。
+  数据来源：BaoStock、腾讯行情、东方财富。各项分数只是财务数据的简单量化，仅供参考，不构成投资建议。
 </footer>
 
 <script src="app.js"></script>

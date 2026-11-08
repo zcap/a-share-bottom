@@ -107,9 +107,9 @@ def test_bad_day_is_rejected(tmp_path, monkeypatch):
     class Broken(FakeSources):
         def daily_bars(self, date):
             out = super().daily_bars(date)
-            for code, (m, b, st) in out.items():
+            for code, (m, b, st, val) in out.items():
                 b = type(b)(**{**b.__dict__, "preclose": b.preclose * 1.1})
-                out[code] = (m, b, st)
+                out[code] = (m, b, st, val)
             return out
 
         def daily_factors(self, date):

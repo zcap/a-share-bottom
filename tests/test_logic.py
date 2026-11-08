@@ -295,3 +295,220 @@ def test_stock_missing_latest_bar_heals(world, tmp_path):
     up, src = run_day(world, 51, d)
     assert ("history", "000002") in src.calls
     check_truth(world, up.stocks, 51)
+
+
+def test_value_scores_ranking():
+    from bottom.engine import Stock as St, value_scores
+
+    def mk(code, pe, pb, ps):
+        return St(code=code, mkt="sh", last_close=10.0, min_low=5.0, min_close=5.0, pe=pe, pb=pb, ps=ps)
+
+    nan = math.nan
+    ss = [
+        mk("600001", 5, 0.6, 0.5),     # 三项都最便宜
+        mk("600002", 15, 1.5, 2.0),
+        mk("600003", 60, 6.0, 8.0),    # 很贵
+        mk("600004", -8, 2.0, 1.0),    # 亏损：市盈率为负，应排在市盈率维度最差
+        mk("600005", 20, nan, nan),    # 只有一个指标：不给分
+        mk("600006", 25, -1.0, 3.0),   # 资不抵债：市净率为负
+    ]
+    sc = value_scores(ss)
+    assert "600005" not in sc
+    assert sc["600001"] == pytest.approx(100.0)
+    assert sc["600001"] > sc["600002"] > sc["600003"]
+    assert all(0 <= v <= 100 for v in sc.values())
+    # 亏损股的市盈率百分位是 0（最差）
+    sc_pe_only = value_scores([mk(c, pe, 1.0, 1.0) for c, pe in [("1", 5), ("2", 50), ("3", -8)]])
+    assert sc_pe_only["3"] < sc_pe_only["2"] < sc_pe_only["1"]
+
+
+def test_valuation_flows_into_export(world, tmp_path):
+    d = str(tmp_path / "state")
+    run_day(world, 60, d)            # 首次构建（没有逐日数据）：估值靠“补取一次”
+    up, src = run_day(world, 61, d)  # 每日增量：估值随全市场数据写入
+    s = up.stocks["000002"]
+    assert s.val_date == world.cal[61] and s.pe == pytest.approx(s.last_close / 0.8)
+    assert up.stocks["688004"].pe < 0  # 亏损股
+    site = str(tmp_path / "site")
+    export(up.stocks, up.meta, site_dir=site, web_dir="web")
+    doc = json.load(open(os.path.join(site, "data", "latest.json"), encoding="utf-8"))
+    F = doc["fields"]
+    rows = {r[0]: dict(zip(F, r)) for r in doc["rows"]}
+    assert rows["000002"]["vscore"] is not None and rows["688004"]["vscore"] is not None
+    assert rows["920007"]["vscore"] is None  # 模拟市场沪深股票太少，北交所不做字段核对，也就没有分
+    # 亏损的 688004 市盈率维度最差，总分应低于盈利且更便宜的 600001
+    assert rows["688004"]["vscore"] < rows["600001"]["vscore"]
+
+
+def test_first_run_fills_valuation(world, tmp_path):
+    d = str(tmp_path)
+    up, src = run_day(world, 60, d)
+    assert up.stocks["600001"].val_date == world.cal[60]
+    assert any("估值：补充沪深" in n for n in up.notes)
+
+
+def test_bj_valuation_field_check():
+    """北交所估值：先用沪深股票核对腾讯字段，选出和 BaoStock 一致的那个；都对不上就不用。"""
+    from bottom.engine import Stock as St
+    from bottom.src_other import Quote
+
+    def mkq(sym, pe39, pe52, pb46):
+        raw = ["0"] * 60
+        raw[39], raw[52], raw[46] = str(pe39), str(pe52), str(pb46)
+        return Quote(sym, "", 10, 10, 10, 10, 10, 100, "2024-03-01", "15:00:00", tuple(raw))
+
+    stocks, quotes = {}, {}
+    for i in range(12):
+        code = f"6000{i:02d}"
+        s = St(code=code, mkt="sh", last_close=10, min_low=5, min_close=5, pe=10 + i, pb=1 + i / 10, val_date="2024-03-01")
+        stocks[code] = s
+        # 第 39 个字段是动态市盈率（和 TTM 不同），第 52 个才和 BaoStock 一致
+        quotes["sh" + code] = mkq("sh" + code, (10 + i) * 1.3, (10 + i) * 1.004, (1 + i / 10) * 0.998)
+    stocks["920001"] = St(code="920001", mkt="bj", last_close=10, min_low=5, min_close=5)
+    quotes["bj920001"] = mkq("bj920001", 99, 33.0, 2.5)
+
+    class Src:
+        def quotes(self, syms):
+            return {k: v for k, v in quotes.items() if k in syms}
+
+    up = Updater(Src(), stocks, {"bs_date": "2024-03-01"}, today="2024-03-02")
+    up.refresh_bj_valuation()
+    assert stocks["920001"].pe == 33.0 and stocks["920001"].pb == 2.5
+    # 所有候选字段都对不上：不写入
+    for k, q in list(quotes.items()):
+        if k.startswith("sh"):
+            raw = list(q.raw)
+            raw[39] = raw[52] = raw[53] = "123"
+            quotes[k] = Quote(q.sym, "", 10, 10, 10, 10, 10, 100, q.date, q.time, tuple(raw))
+    stocks["920001"].pe = math.nan
+    up.refresh_bj_valuation()
+    assert math.isnan(stocks["920001"].pe)
+    assert any("对不上" in n for n in up.notes)
+
+
+# ---------------- 评分：行业内比较、质量、成长、综合 ----------------
+def _st(code, industry="", pe=math.nan, pb=math.nan, ps=math.nan, **kw):
+    from bottom.engine import Stock as St
+    return St(code=code, mkt="sh", last_close=10.0, min_low=5.0, min_close=5.0,
+              industry=industry, pe=pe, pb=pb, ps=ps, **kw)
+
+
+def test_industry_neutral_value():
+    from bottom.engine import compute_scores
+    banks = [_st(f"60{i:04d}", "银行", pe=4 + i * 0.4, pb=0.5 + i * 0.05, ps=1 + i * 0.1) for i in range(10)]
+    tech = [_st(f"30{i:04d}", "半导体", pe=30 + i * 5, pb=3 + i * 0.5, ps=5 + i) for i in range(10)]
+    sc = compute_scores(banks + tech)
+    # 每个行业里最便宜的都是 100 分，最贵的都是 0 分——不再是“银行永远便宜、科技永远贵”
+    assert sc["600000"]["value"] == pytest.approx(100) and sc["300000"]["value"] == pytest.approx(100)
+    assert sc["600009"]["value"] == pytest.approx(0) and sc["300009"]["value"] == pytest.approx(0)
+
+
+def test_small_industry_falls_back_to_market():
+    from bottom.engine import compute_scores, MIN_GROUP
+    big = [_st(f"60{i:04d}", "银行", pe=5 + i, pb=1 + i / 10, ps=1 + i / 5) for i in range(MIN_GROUP)]
+    small = [_st("688001", "小行业", pe=100, pb=10, ps=20), _st("688002", "小行业", pe=200, pb=20, ps=40)]
+    sc = compute_scores(big + small)
+    # 小行业只有 2 只：不在组内排（否则 688001 会是 100 分），而是和全市场比，排在最后
+    assert sc["688001"]["value"] < 15 and sc["688002"]["value"] == pytest.approx(0)
+
+
+def test_quality_growth_total():
+    from bottom.engine import compute_scores, TOTAL_WEIGHTS
+    ss = []
+    for i in range(10):
+        ss.append(_st(f"60{i:04d}", "银行", pe=5 + i, pb=0.6 + i / 10, ps=2 + i / 5,
+                      roe=5 + i, gpm=math.nan, ocfps=1 + i / 10, bps=8.0, rev_yoy=i - 3.0, np_yoy=2 * i - 5.0))
+    ss.append(_st("600099", "银行", pe=6, pb=0.7, ps=2))  # 没有财务数据
+    sc = compute_scores(ss)
+    assert "quality" in sc["600009"]  # 银行没有毛利率，用 ROE 和 经营现金流/净资产 两项
+    assert sc["600009"]["quality"] > sc["600000"]["quality"]
+    assert sc["600009"]["growth"] > sc["600000"]["growth"]
+    d = sc["600005"]
+    assert d["total"] == pytest.approx(sum(d[k] * w for k, w in TOTAL_WEIGHTS.items()))
+    assert "total" not in sc["600099"] and "value" in sc["600099"]  # 缺质量/成长就不给综合分
+
+
+def test_fin_period():
+    from bottom.engine import fin_period
+    assert fin_period("2026-11-08") == "2026-09-30"
+    assert fin_period("2026-11-02") == "2026-06-30"
+    assert fin_period("2026-09-10") == "2026-06-30"
+    assert fin_period("2026-06-01") == "2026-03-31"
+    assert fin_period("2027-02-01") == "2026-09-30"
+    assert fin_period("2027-05-05") == "2027-03-31"
+
+
+def _fin_updater(rows_factory, n=40):
+    stocks = {}
+    for i in range(n):
+        code = f"60{i:04d}"
+        stocks[code] = _st(code, pe=10 + i, pb=1.0 + i / 20, ps=2.0, last_trade="2026-11-06", val_date="2026-11-06")
+
+    class Src:
+        calls = 0
+
+        def financials(self, period):
+            Src.calls += 1
+            return rows_factory(stocks)
+
+    return Updater(Src(), stocks, {}, today="2026-11-08"), Src
+
+
+def test_financials_accepted_and_cached():
+    def good(stocks):
+        return [{"code": c, "industry": "银行", "bps": s.last_close / s.pb, "roe": 9.0, "gpm": 30.0,
+                 "ocfps": 0.5, "rev_yoy": 5.0, "np_yoy": 3.0} for c, s in stocks.items()]
+    up, Src = _fin_updater(good)
+    up.refresh_financials()
+    s = up.stocks["600001"]
+    assert s.industry == "银行" and s.fin_period == "2026-09-30" and s.roe == 9.0
+    assert any("核对通过" in n for n in up.notes)
+    up.refresh_financials()  # 7 天内不重复下载
+    assert Src.calls == 1
+
+
+def test_financials_rejected_when_columns_shift():
+    def shifted(stocks):  # 模拟数据源改格式：“每股净资产”一列放的其实是别的数
+        return [{"code": c, "industry": "银行", "bps": 3.3, "roe": 9.0, "gpm": 30.0,
+                 "ocfps": 0.5, "rev_yoy": 5.0, "np_yoy": 3.0} for c, s in stocks.items()]
+    up, _ = _fin_updater(shifted)
+    up.stocks["600001"].roe = 7.0
+    up.stocks["600001"].fin_period = "2026-06-30"
+    up.refresh_financials()
+    assert up.stocks["600001"].roe == 7.0  # 旧数据保留
+    assert any("没有通过核对" in n for n in up.notes)
+
+    def few(stocks):
+        return [{"code": "600001", "industry": "", "bps": 1, "roe": 1, "gpm": 1, "ocfps": 1, "rev_yoy": 1, "np_yoy": 1}]
+    up2, _ = _fin_updater(few)
+    up2.refresh_financials()
+    assert any("只覆盖" in n for n in up2.notes)
+
+
+def test_scores_end_to_end(world, tmp_path):
+    d = str(tmp_path / "state")
+    _, src0 = run_day(world, 60, d)
+    assert ("financials", "2024-03-31") in src0.calls or ("financials", "2023-09-30") in src0.calls
+    up, src = run_day(world, 61, d)
+    assert not any(k == "financials" for k, _ in src.calls)  # 一周内不重复下载
+    s = up.stocks["000002"]
+    assert s.industry == "银行" and math.isfinite(s.roe)
+    site = str(tmp_path / "site")
+    export(up.stocks, up.meta, site_dir=site, web_dir="web")
+    doc = json.load(open(os.path.join(site, "data", "latest.json"), encoding="utf-8"))
+    F = doc["fields"]
+    rows = {r[0]: dict(zip(F, r)) for r in doc["rows"]}
+    for k in ("vscore", "qscore", "gscore", "tscore", "industry"):
+        assert k in F
+    assert rows["000002"]["tscore"] is not None
+
+
+def test_rebuild_keeps_valuation_industry_financials(world, tmp_path):
+    d = str(tmp_path)
+    run_day(world, 60, d)
+    up, _ = run_day(world, 61, d)
+    before = {c: (s.pe, s.industry, s.roe, s.fin_period) for c, s in up.stocks.items()}
+    up2, src = run_day(world, 61, d, mode="rebuild")  # 完整重算价格历史
+    for c, s in up2.stocks.items():
+        assert (s.pe, s.industry, s.roe, s.fin_period) == before[c] or math.isnan(before[c][0])
+    assert up2.stocks["000002"].industry == "银行" and math.isfinite(up2.stocks["000002"].roe)

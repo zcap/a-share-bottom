@@ -42,6 +42,10 @@ class Quote:
     volume: float  # 手
     date: str  # 行情时间对应的日期 YYYY-MM-DD
     time: str  # HH:MM:SS
+    raw: tuple = ()  # 全部原始字段（估值字段的位置先和 BaoStock 核对再使用）
+
+    def field(self, i: int) -> float:
+        return _f(self.raw[i]) if i < len(self.raw) else math.nan
 
     def to_bar(self) -> Bar:
         traded = is_pos(self.price) and is_pos(self.volume)
@@ -77,6 +81,7 @@ def parse_quotes(text: str) -> dict[str, Quote]:
             volume=_f(f[6]),
             date=norm_date(ts[:8]) if len(ts) >= 8 else "",
             time=f"{ts[8:10]}:{ts[10:12]}:{ts[12:14]}" if len(ts) >= 14 else "",
+            raw=tuple(f),
         )
     return out
 
@@ -174,4 +179,35 @@ def issue_prices() -> dict[str, float]:
                 out.setdefault(str(c).zfill(6), _f(p))
     except Exception as e:  # noqa: BLE001
         log.warning("北交所发行价获取失败：%s", e)
+    return out
+
+
+# ---------------- 财务数据（质量分、成长分、行业） ----------------
+def financials(period: str) -> list[dict]:
+    """东方财富数据中心“业绩报表”：某一报告期全部 A 股（含北交所）的财务指标，一次分页取完。
+
+    period 形如 2026-09-30。返回 [{code, industry, bps, roe, gpm, ocfps, rev_yoy, np_yoy}]。
+    数据中心接口不在东方财富行情服务器的限流范围内。"""
+    import akshare as ak
+
+    df = ak.stock_yjbb_em(date=period.replace("-", ""))
+    cols = {
+        "bps": ("每股净资产",),
+        "roe": ("净资产收益率",),
+        "gpm": ("销售毛利率",),
+        "ocfps": ("每股经营现金流量",),
+        "rev_yoy": ("营业总收入-同比增长",),
+        "np_yoy": ("净利润-同比增长",),
+    }
+    code_col = _pick(df, "股票代码", "代码")
+    ind_col = _pick(df, "所处行业", "行业")
+    series = {k: _pick(df, *names) for k, names in cols.items()}
+    out = []
+    for i in range(len(df)):
+        rec = {"code": str(code_col.iloc[i]).zfill(6), "industry": str(ind_col.iloc[i] or "").strip()}
+        if rec["industry"] in ("nan", "None", "-"):
+            rec["industry"] = ""
+        for k, ser in series.items():
+            rec[k] = _f(ser.iloc[i])
+        out.append(rec)
     return out

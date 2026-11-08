@@ -10,7 +10,10 @@ import time
 from collections import Counter
 from typing import Iterator
 
-from .engine import Stock, apply_bar, fill_issue_price, is_a_share, rebuild_from_history
+import math
+import statistics
+
+from .engine import Stock, apply_bar, fill_issue_price, fin_period, is_a_share, is_pos, rebuild_from_history
 from .util import add_days, bj_now, bj_today, summary
 
 log = logging.getLogger(__name__)
@@ -19,8 +22,23 @@ MAX_CATCHUP_DAYS = 15  # 落下超过这么多个交易日就直接全量重建
 CHECKPOINT_EVERY = 300  # 全量构建时每处理这么多只保存一次进度
 EVENT_RATIO_LIMIT = 0.15  # 某天被识别为除权除息的比例超过它，说明数据对不上，放弃当天更新
 EVENT_CHECK_MIN = 50  # 当天有交易的股票少于这个数时不做上面的检查
+TENCENT_PE_FIELDS = (39, 52, 53)  # 腾讯行情里可能是市盈率的字段位置，运行时和 BaoStock 核对后选用
+TENCENT_PB_FIELDS = (46,)
+VALUATION_MATCH_TOL = 0.03  # 腾讯与 BaoStock 估值的中位相对误差小于它，才认为字段含义一致
+FIN_REFRESH_DAYS = 7  # 财务数据（业绩报表）每隔几天重新取一次，补上新股和更正
+FIN_MIN_COVERAGE = 0.5  # 业绩报表覆盖的股票少于上市股票的一半，视为数据不完整
+FIN_PB_TOL = 0.10  # 用 收盘价/每股净资产 和 BaoStock 市净率核对，中位相对误差的上限
 COMPLETE_RATIO = 0.95  # BaoStock 全市场单日数据条数达到上市股票数的这个比例，才算当天已入库完整（停牌股也有记录）
 FACTOR_REL_TOL = 2e-4  # 每周核对时，复权因子相对误差超过它就重算
+
+
+def set_valuation(s: Stock, val, date: str) -> bool:
+    """写入一只股票的估值。三项都缺（如停牌）时保留旧值。"""
+    pe, pb, ps = (float(v) if isinstance(v, (int, float)) and math.isfinite(v) and v != 0 else math.nan for v in val)
+    if all(math.isnan(v) for v in (pe, pb, ps)):
+        return False
+    s.pe, s.pb, s.ps, s.val_date = pe, pb, ps, date
+    return True
 
 
 class Sources:
@@ -111,6 +129,11 @@ class Sources:
         from .src_other import issue_prices
 
         return issue_prices()
+
+    def financials(self, period):
+        from .src_other import financials
+
+        return financials(period)
 
     def close(self):
         self.bs.close()
@@ -383,6 +406,8 @@ class Updater:
                 if s.code in need_rebuild:
                     continue
                 r = apply_bar(s, item[1], factors.get(s.code))
+                if len(item) > 3:
+                    set_valuation(s, item[3], d)
                 stat[r] += 1
                 if r == "event" and s.code not in factors:
                     stat["event_by_preclose"] += 1
@@ -432,6 +457,119 @@ class Updater:
             return
         self.note(f"北交所 {self.today}：正常 {stat['ok']}，除权除息 {stat['event']}，停牌 {stat['suspended']}")
 
+    # ---------- 估值（价值分用） ----------
+    def refresh_valuation_shsz(self) -> None:
+        """沪深估值来自 BaoStock 全市场单日数据。每日增量时已顺带写入；
+        这里只在大量股票缺最新估值时（首次上线、完整重建之后）补取一次。"""
+        end = self.meta.get("bs_date")
+        shsz = [s for s in self.stocks.values() if s.mkt != "bj" and s.has_data()]
+        stale = [s for s in shsz if s.val_date != end]
+        if not end or not shsz or len(stale) < 0.05 * len(shsz):
+            return
+        bars = self.src.daily_bars(end)
+        n = 0
+        for s in stale:
+            item = bars.get(s.code)
+            if item is not None and len(item) > 3 and set_valuation(s, item[3], end):
+                n += 1
+        self.note(f"估值：补充沪深 {n} 只（{end}）")
+
+    def refresh_bj_valuation(self) -> None:
+        """北交所估值来自腾讯行情。腾讯的字段没有官方文档，先拿几十只沪深股票
+        和 BaoStock 的市盈率、市净率对一下，确认字段含义一致才使用；对不上就不给北交所打分。"""
+        bj = [s for s in self.stocks.values() if s.mkt == "bj" and s.has_data()]
+        end = self.meta.get("bs_date")
+        sample = [s for s in self.stocks.values()
+                  if s.mkt != "bj" and s.val_date == end and is_pos(s.pe) and is_pos(s.pb)][:40]
+        if not bj or len(sample) < 10:
+            return
+        quotes = self.src.quotes([s.mkt + s.code for s in sample] + ["bj" + s.code for s in bj])
+
+        def best(candidates, attr):
+            choice = None
+            for i in candidates:
+                diffs = []
+                for s in sample:
+                    q = quotes.get(s.mkt + s.code)
+                    v = q.field(i) if q is not None else math.nan
+                    if is_pos(v):
+                        diffs.append(abs(v / getattr(s, attr) - 1))
+                if len(diffs) >= 10:
+                    med = statistics.median(diffs)
+                    if med < VALUATION_MATCH_TOL and (choice is None or med < choice[1]):
+                        choice = (i, med)
+            return choice
+
+        pe_f, pb_f = best(TENCENT_PE_FIELDS, "pe"), best(TENCENT_PB_FIELDS, "pb")
+        if pe_f is None or pb_f is None:
+            self.note("⚠️ 北交所估值：腾讯行情字段和 BaoStock 对不上，本次不更新北交所价值分")
+            return
+        n = 0
+        for s in bj:
+            q = quotes.get("bj" + s.code)
+            if q is not None and q.date and set_valuation(s, (q.field(pe_f[0]), q.field(pb_f[0]), math.nan), q.date):
+                n += 1
+        self.note(f"北交所估值：腾讯字段核对通过（市盈率误差 {pe_f[1]:.1%}，市净率误差 {pb_f[1]:.1%}），更新 {n} 只")
+
+    # ---------- 财务数据（质量分、成长分、行业） ----------
+    def refresh_financials(self) -> None:
+        """全市场用同一个报告期（都已过披露截止日的最近一期）比较，保证公平。
+        每周刷新一次；进入新的报告期时立即刷新。数据先核对再使用，核对不过就保留旧数据。"""
+        period = fin_period(self.today)
+        last = self.meta.get("fin_fetched", "")
+        if self.meta.get("fin_period") == period and last and add_days(last, FIN_REFRESH_DAYS) > self.today:
+            return
+        rows = self.src.financials(period)
+        ok, msg = self.check_financials(rows)
+        if not ok:
+            self.note(f"⚠️ 财务数据（{period}）没有通过核对，本次不更新质量分、成长分：{msg}")
+            return
+        n = 0
+        for r in rows:
+            s = self.stocks.get(r["code"])
+            if s is None:
+                continue
+            for k in ("bps", "roe", "gpm", "ocfps", "rev_yoy", "np_yoy"):
+                setattr(s, k, r[k])
+            if r["industry"]:
+                s.industry = r["industry"]
+            s.fin_period = period
+            n += 1
+        # 这一期没有报告的股票（如刚上市）：清掉旧报告期的数据，避免和别人用不同报告期比较
+        for s in self.stocks.values():
+            if s.fin_period and s.fin_period != period:
+                for k in ("bps", "roe", "gpm", "ocfps", "rev_yoy", "np_yoy"):
+                    setattr(s, k, math.nan)
+                s.fin_period = ""
+        self.meta["fin_period"] = period
+        self.meta["fin_fetched"] = self.today
+        self.note(f"财务数据：{period} 报告期，匹配 {n} 只；{msg}")
+
+    def check_financials(self, rows: list[dict]) -> tuple[bool, str]:
+        """核对东方财富业绩报表的字段含义是否正确（防止数据源改格式后错位）。"""
+        listed = sum(1 for s in self.stocks.values() if s.has_data())
+        matched = [r for r in rows if r["code"] in self.stocks]
+        if listed and len(matched) < FIN_MIN_COVERAGE * listed:
+            return False, f"只覆盖 {len(matched)}/{listed} 只"
+        roe = [r["roe"] for r in matched if math.isfinite(r["roe"])]
+        gpm = [r["gpm"] for r in matched if math.isfinite(r["gpm"])]
+        if len(roe) < 0.5 * len(matched) or not -20 < statistics.median(roe) < 40:
+            return False, "净资产收益率数值异常"
+        if gpm and not 3 < statistics.median(gpm) < 80:
+            return False, "毛利率数值异常"
+        # 收盘价 / 每股净资产 应该约等于 BaoStock 的市净率
+        diffs = []
+        for r in matched:
+            s = self.stocks[r["code"]]
+            if is_pos(r["bps"]) and is_pos(s.pb) and is_pos(s.last_close) and s.val_date == s.last_trade:
+                diffs.append(abs(s.last_close / r["bps"] / s.pb - 1))
+        if len(diffs) >= 30:
+            med = statistics.median(diffs)
+            if med > FIN_PB_TOL:
+                return False, f"每股净资产和 BaoStock 市净率对不上（中位误差 {med:.1%}）"
+            return True, f"每股净资产与 BaoStock 市净率核对通过（中位误差 {med:.1%}）"
+        return True, "暂无足够的市净率数据做交叉核对，只做了数值范围检查"
+
     # ---------- 发行价 ----------
     def update_issue_prices(self, force: bool = False) -> None:
         recent = add_days(self.today, -60)
@@ -468,6 +606,11 @@ class Updater:
         if mode == "verify":
             self.run_verify()
         self.daily_bj()
+        for step in (self.refresh_valuation_shsz, self.refresh_bj_valuation, self.refresh_financials):
+            try:
+                step()
+            except Exception as e:  # noqa: BLE001  估值失败只影响价值分，不影响主数据
+                self.note(f"⚠️ {step.__name__} 失败（只影响评分，不影响历史最低价数据）：{type(e).__name__}: {e}")
         self.update_issue_prices()
         self.meta["updated_at"] = bj_now().strftime("%Y-%m-%d %H:%M")
 
@@ -487,3 +630,9 @@ def report(up: Updater) -> None:
             f"缺失 {sum(1 for s in stocks if not s.issue_src)}")
     if both:
         summary(f"- 校验：东方财富发行价与首日前收盘价一致 {agree}/{len(both)}")
+    from .engine import compute_scores
+
+    sc = compute_scores(stocks)
+    cnt = {k: sum(1 for d in sc.values() if k in d) for k in ("value", "quality", "growth", "total")}
+    summary(f"- 评分：价值分 {cnt['value']} 只，质量分 {cnt['quality']} 只，成长分 {cnt['growth']} 只，"
+            f"综合分 {cnt['total']} 只；有行业信息 {sum(1 for s in stocks if s.industry)} 只")

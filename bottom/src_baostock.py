@@ -156,8 +156,8 @@ class BaoStock:
         return rows[-1][0]
 
     # ---------- 某一天的全市场数据 ----------
-    def daily_bars(self, date: str) -> dict[str, tuple[str, Bar, bool]]:
-        """{6 位代码: (市场, 日线, 是否 ST)}；BaoStock 还没入库时返回空。"""
+    def daily_bars(self, date: str) -> dict[str, tuple]:
+        """{6 位代码: (市场, 日线, 是否 ST, (市盈率TTM, 市净率MRQ, 市销率TTM))}；BaoStock 还没入库时返回空。"""
         cols, rows = self._query(bs.query_daily_history_k_AStock, date=date)
         out = {}
         for r in rows:
@@ -165,7 +165,8 @@ class BaoStock:
             if d.get("date") and d["date"] != date:
                 continue
             mkt, code = d["code"].split(".")
-            out[code] = (mkt, _bar(d), d.get("isST") == "1")
+            val = (_f(d.get("peTTM")), _f(d.get("pbMRQ")), _f(d.get("psTTM")))
+            out[code] = (mkt, _bar(d), d.get("isST") == "1", val)
         return out
 
     def daily_factors(self, date: str) -> dict[str, float]:
