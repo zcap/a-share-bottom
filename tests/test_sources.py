@@ -123,3 +123,62 @@ def test_bad_day_is_rejected(tmp_path, monkeypatch):
         if s.mkt != "bj":
             assert up.stocks[code].to_record() == s.to_record()
     assert any("放弃" in n for n in up.notes)
+
+
+def test_eastmoney_financials_paging_and_parsing(monkeypatch):
+    import bottom.src_other as so
+
+    names = ["SECURITY_CODE", "SECURITY_NAME_ABBR", "TRADE_MARKET_CODE", "TRADE_MARKET", "SECURITY_TYPE_CODE",
+             "SECURITY_TYPE", "UPDATE_DATE", "REPORTDATE", "BASIC_EPS", "DEDUCT_BASIC_EPS", "TOTAL_OPERATE_INCOME",
+             "PARENT_NETPROFIT", "WEIGHTAVG_ROE", "YSTZ", "SJLTZ", "BPS", "MGJYXJJE", "XSMLL", "YSHZ", "SJLHZ",
+             "ASSIGNDSCRPT", "PAYYEAR", "PUBLISHNAME"]
+
+    def row(code, roe, ind, rename=False):
+        vals = [code, "名", "", "", "", "", "", "", 1, 1, 1, 1, roe, 5.0, 6.0, 10.0, 0.8, 30.0, 0, 0, "", "", ind]
+        keys = [f"F{i}" for i in range(len(names))] if rename else names
+        return dict(zip(keys, vals))
+
+    pages = {1: [row("600519", 25.0, "酿酒行业"), row("1", 8.0, None)], 2: [row("920001", 5.0, "专用设备")]}
+    calls = []
+    fails = {"n": 1}
+
+    class Resp:
+        def __init__(self, p):
+            self.p = p
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"result": {"pages": 2, "data": pages[self.p]}}
+
+    def fake_get(url, params=None, **kw):
+        calls.append(params["pageNumber"])
+        if fails["n"]:
+            fails["n"] -= 1
+            raise requests.exceptions.ChunkedEncodingError("Response ended prematurely")
+        return Resp(int(params["pageNumber"]))
+
+    import requests
+    monkeypatch.setattr(so.requests, "get", fake_get)
+    monkeypatch.setattr(so.time, "sleep", lambda s: None)
+    recs = {r["code"]: r for r in so.financials("2026-09-30")}
+    assert calls == ["1", "1", "2"]  # 第一次被中途断开，重试后成功
+    assert recs["600519"]["roe"] == 25.0 and recs["600519"]["bps"] == 10.0 and recs["600519"]["gpm"] == 30.0
+    assert recs["600519"]["ocfps"] == 0.8 and recs["600519"]["rev_yoy"] == 5.0 and recs["600519"]["np_yoy"] == 6.0
+    assert recs["000001"]["industry"] == "" and recs["920001"]["industry"] == "专用设备"
+    # 字段名变了：按顺序读取，结果一样
+    assert so._em_rows_to_records([row("600519", 25.0, "酿酒行业", rename=True)])[0]["bps"] == 10.0
+
+
+def test_eastmoney_gives_up_after_retries(monkeypatch):
+    import requests
+    import bottom.src_other as so
+
+    def boom(*a, **k):
+        raise requests.exceptions.ChunkedEncodingError("Response ended prematurely")
+
+    monkeypatch.setattr(so.requests, "get", boom)
+    monkeypatch.setattr(so.time, "sleep", lambda s: None)
+    with pytest.raises(requests.exceptions.ChunkedEncodingError):
+        so.financials("2026-09-30")

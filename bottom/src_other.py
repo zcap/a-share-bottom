@@ -183,31 +183,89 @@ def issue_prices() -> dict[str, float]:
 
 
 # ---------------- 财务数据（质量分、成长分、行业） ----------------
+EM_DATACENTER = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+EM_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/120.0 Safari/537.36",
+    "Referer": "https://data.eastmoney.com/",
+}
+EM_PAGE_SIZE = 200  # 每页条数小一些，单次响应小，不容易在传输中被断开
+
+# 业绩报表（RPT_LICO_FN_CPD）的字段名；对不上时按 AKShare 记录的字段顺序取（见 _EM_POS）
+_EM_NAMES = {
+    "code": "SECURITY_CODE", "roe": "WEIGHTAVG_ROE", "rev_yoy": "YSTZ", "np_yoy": "SJLTZ",
+    "bps": "BPS", "ocfps": "MGJYXJJE", "gpm": "XSMLL", "industry": "PUBLISHNAME",
+}
+_EM_POS = {"code": 0, "roe": 12, "rev_yoy": 13, "np_yoy": 14, "bps": 15, "ocfps": 16, "gpm": 17, "industry": 22}
+
+
+def _em_get(params: dict, tries: int = 5) -> dict:
+    """请求东方财富数据中心。每次新建连接（复用连接时偶尔会被对方中途断开），失败按指数退避重试。"""
+    last = None
+    for attempt in range(tries):
+        try:
+            r = requests.get(EM_DATACENTER, params=params, headers=EM_HEADERS, timeout=30)
+            r.raise_for_status()
+            return r.json()
+        except (requests.RequestException, ValueError) as e:  # 含 ChunkedEncodingError、JSON 不完整
+            last = e
+            log.warning("东方财富数据中心请求失败（第 %d 次）：%s: %s", attempt + 1, type(e).__name__, e)
+            time.sleep(min(30, 2 ** attempt) + 0.5 * attempt)
+    raise last
+
+
+def _em_rows_to_records(rows: list[dict]) -> list[dict]:
+    """按字段名取值；字段名对不上时按字段顺序取。取到的数还要经过 pipeline 里的交叉核对才会使用。"""
+    if not rows:
+        return []
+    keys = list(rows[0].keys())
+    by_name = all(v in rows[0] for v in _EM_NAMES.values())
+    if not by_name:
+        log.warning("业绩报表字段名和预期不同，改按字段顺序读取：%s", keys[:25])
+    out = []
+    for row in rows:
+        vals = list(row.values())
+
+        def get(k):
+            if by_name:
+                return row.get(_EM_NAMES[k])
+            i = _EM_POS[k]
+            return vals[i] if i < len(vals) else None
+
+        code = str(get("code") or "").strip()
+        if not code:
+            continue
+        ind = get("industry")
+        ind = "" if ind is None or str(ind).strip() in ("", "nan", "None", "-") else str(ind).strip()
+        rec = {"code": code.zfill(6), "industry": ind}
+        for k in ("bps", "roe", "gpm", "ocfps", "rev_yoy", "np_yoy"):
+            rec[k] = _f(get(k))
+        out.append(rec)
+    return out
+
+
 def financials(period: str) -> list[dict]:
-    """东方财富数据中心“业绩报表”：某一报告期全部 A 股（含北交所）的财务指标，一次分页取完。
+    """东方财富数据中心“业绩报表”：某一报告期全部 A 股（含北交所）的财务指标，分页取完。
 
     period 形如 2026-09-30。返回 [{code, industry, bps, roe, gpm, ocfps, rev_yoy, np_yoy}]。
     数据中心接口不在东方财富行情服务器的限流范围内。"""
-    import akshare as ak
-
-    df = ak.stock_yjbb_em(date=period.replace("-", ""))
-    cols = {
-        "bps": ("每股净资产",),
-        "roe": ("净资产收益率",),
-        "gpm": ("销售毛利率",),
-        "ocfps": ("每股经营现金流量",),
-        "rev_yoy": ("营业总收入-同比增长",),
-        "np_yoy": ("净利润-同比增长",),
+    params = {
+        "sortColumns": "SECURITY_CODE",
+        "sortTypes": "1",
+        "pageSize": str(EM_PAGE_SIZE),
+        "pageNumber": "1",
+        "reportName": "RPT_LICO_FN_CPD",
+        "columns": "ALL",
+        "filter": f"(REPORTDATE='{period}')",
     }
-    code_col = _pick(df, "股票代码", "代码")
-    ind_col = _pick(df, "所处行业", "行业")
-    series = {k: _pick(df, *names) for k, names in cols.items()}
-    out = []
-    for i in range(len(df)):
-        rec = {"code": str(code_col.iloc[i]).zfill(6), "industry": str(ind_col.iloc[i] or "").strip()}
-        if rec["industry"] in ("nan", "None", "-"):
-            rec["industry"] = ""
-        for k, ser in series.items():
-            rec[k] = _f(ser.iloc[i])
-        out.append(rec)
-    return out
+    first = _em_get(params)
+    result = first.get("result") or {}
+    pages = int(result.get("pages") or 0)
+    rows = list(result.get("data") or [])
+    for page in range(2, pages + 1):
+        time.sleep(0.5)
+        data = _em_get({**params, "pageNumber": str(page)})
+        rows.extend((data.get("result") or {}).get("data") or [])
+    recs = _em_rows_to_records(rows)
+    # 分页过程中数据更新可能导致个别重复，按代码去重
+    return list({r["code"]: r for r in recs}.values())
