@@ -199,12 +199,12 @@ _EM_NAMES = {
 _EM_POS = {"code": 0, "roe": 12, "rev_yoy": 13, "np_yoy": 14, "bps": 15, "ocfps": 16, "gpm": 17, "industry": 22}
 
 
-def _em_get(params: dict, tries: int = 5) -> dict:
+def _em_get(params: dict, tries: int = 5, url: str = EM_DATACENTER) -> dict:
     """请求东方财富数据中心。每次新建连接（复用连接时偶尔会被对方中途断开），失败按指数退避重试。"""
     last = None
     for attempt in range(tries):
         try:
-            r = requests.get(EM_DATACENTER, params=params, headers=EM_HEADERS, timeout=30)
+            r = requests.get(url, params=params, headers=EM_HEADERS, timeout=30)
             r.raise_for_status()
             return r.json()
         except (requests.RequestException, ValueError) as e:  # 含 ChunkedEncodingError、JSON 不完整
@@ -269,3 +269,56 @@ def financials(period: str) -> list[dict]:
     recs = _em_rows_to_records(rows)
     # 分页过程中数据更新可能导致个别重复，按代码去重
     return list({r["code"]: r for r in recs}.values())
+
+
+# ---------------- 东方财富 F10 资料（发行价） ----------------
+EM_SECURITIES = "https://datacenter.eastmoney.com/securities/api/data/v1/get"
+
+
+def em_f10_all(report: str, source: str, columns: str = "ALL", page_size: int = 500) -> list[dict]:
+    """不加条件分页取完东方财富 F10 某张表（按证券代码排序，避免翻页时顺序变化导致漏行）。"""
+    base = {"reportName": report, "columns": columns, "pageSize": str(page_size), "source": source, "client": "PC",
+            "sortColumns": "SECUCODE", "sortTypes": "1"}
+    first = _em_get({**base, "pageNumber": "1"}, url=EM_SECURITIES)
+    if not first.get("result"):  # 个别表不支持排序参数时去掉排序再试
+        base.pop("sortColumns"), base.pop("sortTypes")
+        first = _em_get({**base, "pageNumber": "1"}, url=EM_SECURITIES)
+    result = first.get("result") or {}
+    rows = list(result.get("data") or [])
+    pages = int(result.get("pages") or 0)
+    for page in range(2, pages + 1):
+        time.sleep(0.3)
+        data = _em_get({**base, "pageNumber": str(page)}, url=EM_SECURITIES)
+        rows.extend((data.get("result") or {}).get("data") or [])
+    total = int(result.get("count") or 0)
+    uniq = {str(r.get("SECUCODE")): r for r in rows}
+    if total and len(uniq) < 0.98 * total:
+        raise RuntimeError(f"{report} 只取到 {len(uniq)} / {total} 条，数据不完整")
+    return list(uniq.values())
+
+
+_SWAP = re.compile(r"换股|吸收合并")
+
+
+def issue_info_f10() -> dict[str, dict]:
+    """东方财富 F10“发行相关”：全部 A 股（含 1990 年代上市、含北交所、含已退市）的每股发行价。
+
+    返回 {代码: {price, list_date, first_close, swap}}；swap=True 表示换股吸收合并等方式上市，没有真正的发行价。"""
+    rows = em_f10_all("RPT_PCF10_ORG_ISSUEINFO", source="HSF10")
+    if rows:
+        log.info("东方财富发行资料字段：%s", list(rows[0].keys()))
+    out: dict[str, dict] = {}
+    for d in rows:
+        code = str(d.get("SECUCODE") or "").split(".")[0]
+        if not re.fullmatch(r"\d{6}", code):
+            continue
+        # 只在“发行方式 / 发行类型”之类的字段里找“换股”，避免误判
+        way_keys = [k for k in d if re.search(r"WAY|TYPE|METHOD|MODE", k)]
+        texts = " ".join(str(d[k]) for k in way_keys if isinstance(d[k], str))
+        out[code] = {
+            "price": _f(d.get("ISSUE_PRICE")),
+            "list_date": norm_date(d.get("LISTING_DATE")),
+            "first_close": _f(d.get("CLOSE_PRICE")),
+            "swap": bool(_SWAP.search(texts)),
+        }
+    return out

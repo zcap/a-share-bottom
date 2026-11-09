@@ -432,13 +432,86 @@ def yahoo_screen():
     return "；".join(out)
 
 
+# ======================= 第 1 步补充检查 =======================
+def _adj_ratio(series, date):
+    """series = [(日期, 复权收盘价)]（升序）。返回 最新价 ÷ 指定日期（或之后第一天）的复权价。"""
+    after = [v for d, v in series if d >= date and v]
+    return series[-1][1] / after[0] if after and series else None
+
+
+def _tencent_hk_fq(code):
+    url = "https://web.ifzq.gtimg.cn/appstock/app/hkfqkline/get"
+    r = _get(url, params={"param": f"hk{code},day,1990-01-01,2030-12-31,10000,qfq"},
+             headers={"User-Agent": BROWSER["User-Agent"]})
+    j = r.json()
+    node = ((j.get("data") or {}).get(f"hk{code}") or {})
+    rows = node.get("qfqday") or node.get("day") or []
+    return [(str(x[0])[:10], _f(x[2])) for x in rows if len(x) > 2]
+
+
+def _sina_hk_fq(code):
+    import akshare as ak
+
+    df = ak.stock_hk_daily(symbol=code, adjust="qfq")
+    return [(str(d)[:10], _f(c)) for d, c in zip(df["date"], df["close"])]
+
+
+def _yahoo_hk(code):
+    import yfinance as yf
+
+    h = yf.Ticker(f"{int(code):04d}.HK").history(period="max", auto_adjust=True, actions=False)
+    return [(ts.strftime("%Y-%m-%d"), _f(c)) for ts, c in zip(h.index, h["Close"])]
+
+
+@check("补充", "港股复权口径对比（供股是否复权、历史起点）")
+def hk_adjust_compare():
+    """汇丰 2009 年 3 月供股、渣打 2015 年 12 月供股；腾讯控股作对照（没有供股）。
+    比较三个来源的“现价 ÷ 供股前复权价”：数值接近说明复权口径一致；差出约一成说明某个来源没有按供股复权。"""
+    cases = (("00005", "2009-02-27"), ("02888", "2015-11-30"), ("00700", "2009-02-27"))
+    out = []
+    for code, date in cases:
+        parts = []
+        for label, fn in (("Yahoo", _yahoo_hk), ("腾讯", _tencent_hk_fq), ("新浪", _sina_hk_fq)):
+            try:
+                ser = [(d, v) for d, v in fn(code) if v]
+                ratio = _adj_ratio(ser, date)
+                parts.append(f"{label} 起 {ser[0][0] if ser else '?'} 共 {len(ser)} 根，现价/{date} = {ratio:.3f}"
+                             if ratio else f"{label} 无数据")
+            except Exception as e:  # noqa: BLE001
+                parts.append(f"{label} 失败 {type(e).__name__}")
+            time.sleep(0.5)
+        out.append(f"{code}：" + "；".join(parts))
+    if all("失败" in x or "无数据" in x for o in out for x in o.split("；")):
+        raise RuntimeError(" ‖ ".join(out))
+    return " ‖ ".join(out)
+
+
+@check("补充", "A 股发行资料字段（识别换股上市）")
+def a_f10_fields():
+    out = []
+    for code in ("001979.SZ", "601766.SH", "000002.SZ", "600519.SH", "601360.SH"):
+        res, _ = _em(EM_SEC, {"reportName": "RPT_PCF10_ORG_ISSUEINFO", "columns": "ALL",
+                              "filter": f'(SECUCODE="{code}")', "pageNumber": "1", "pageSize": "5",
+                              "source": "HSF10", "client": "PC"})
+        d = (res.get("data") or [{}])[0]
+        if not d:
+            out.append(f"{code} 无记录")
+            continue
+        texts = {k: v for k, v in d.items() if isinstance(v, str) and k not in ("SECUCODE", "SECURITY_CODE")
+                 and not k.endswith("DATE")}
+        out.append(f"{code} 发行价 {d.get('ISSUE_PRICE')}，文字字段 {json.dumps(texts, ensure_ascii=False)[:220]}")
+        log.info("发行资料 %s 全部字段：%s", code, d)
+        time.sleep(0.5)
+    return "；".join(out)
+
+
 ALL = [us_list, hk_list, yahoo_single, yahoo_rate, tencent_hkus,
        a_sina, a_em_f10, a_em_ipo_history, hk_em_f10, hk_ths, hk_hkex_nlr, us_nasdaq_ipo, us_yahoo_ipo,
-       yahoo_info, yahoo_screen]
+       yahoo_info, yahoo_screen, hk_adjust_compare, a_f10_fields]
 
 TITLES = {"列表": "股票列表（新股、退市识别）", "历史": "历史行情（Yahoo）", "行情": "实时行情（腾讯）",
           "发行价-A股": "发行价：A 股", "发行价-港股": "发行价：港股", "发行价-美股": "发行价：美股",
-          "估值": "估值与财务（第 2 步评分用）"}
+          "估值": "估值与财务（第 2 步评分用）", "补充": "第 1 步补充检查"}
 
 
 def probe_global() -> int:

@@ -523,3 +523,50 @@ def test_delisting_stocks_not_scored():
     sc = compute_scores(ss)
     assert "002731" not in sc
     assert sc["600000"]["value"] == pytest.approx(100)  # 最便宜的正常股票仍是 100 分，没被退市股挤掉
+
+
+def test_f10_issue_prices(world, tmp_path):
+    d = str(tmp_path)
+    f10 = {
+        "600001": {"price": 3.0, "first_close": 3.3, "swap": False},  # 和首日前收盘一致
+        "000002": {"price": 8.0, "first_close": 8.1, "swap": True},  # 换股上市：没有发行价
+        "300003": {"price": 19.5, "first_close": 25.0, "swap": False},  # 和首日前收盘（20）不一致，以发行资料为准
+        "002005": {"price": 600.0, "first_close": 6.0, "swap": False},  # 数值不合理，不采用
+        "688004": {"price": 1.0, "first_close": 50.0, "swap": False},  # 已有东方财富新股数据，不覆盖
+        "999999": {"price": 5.0, "first_close": 5.0, "swap": False},
+        "920007": {"price": 9.0, "first_close": 9.5, "swap": False, "list_date": "2001-01-01"},  # 上市日期对不上
+    }
+    up, src = run_day(world, 125, d, f10=f10)
+    st = up.stocks
+    assert (st["600001"].issue_src, st["600001"].issue_price) == ("f10", 3.0)
+    assert st["000002"].issue_src == "none" and not st["000002"].issue_price == st["000002"].issue_price
+    assert st["000002"].metrics()["low_date"] != "发行价"
+    assert (st["300003"].issue_src, st["300003"].issue_price) == ("f10", 19.5)
+    assert (st["002005"].issue_src, st["002005"].issue_price) == ("infer", 6.0)
+    assert (st["688004"].issue_src, st["688004"].issue_price) == ("em", 50.0)
+    assert st["920007"].issue_src == "em"  # 北交所已有东方财富新股数据
+    assert any("不一致" in n and "300003" in n for n in up.notes)
+    assert up.meta["f10_issue_date"] == world.cal[125]
+    # 一周内不再请求；换股上市的标记在全量重建后仍然保留，不会被重新推断
+    up, src = run_day(world, 126, d, f10=f10)
+    assert ("f10", None) not in src.calls
+    up, src = run_day(world, 127, d, mode="rebuild", f10=None)
+    assert up.stocks["000002"].issue_src == "none"
+    assert up.stocks["600001"].issue_src == "f10"
+    assert any("发行资料获取失败" in n for n in up.notes)
+
+
+def test_f10_incomplete_not_used(world, tmp_path):
+    d = str(tmp_path)
+    up, _ = run_day(world, 125, d, f10={"600001": {"price": 1.0, "first_close": 3.0, "swap": True}})
+    assert up.stocks["600001"].issue_src == "infer"
+    assert "f10_issue_date" not in up.meta
+
+
+def test_f10_listing_date_mismatch_rejected(world, tmp_path):
+    d = str(tmp_path)
+    f10 = {c: {"price": fs.issue, "first_close": fs.issue, "swap": False} for c, fs in world.stocks.items()}
+    f10["600001"] = {"price": 2.0, "first_close": 2.1, "swap": False, "list_date": "1995-01-01"}  # 代码被重复使用
+    up, _ = run_day(world, 125, d, f10=f10)
+    assert up.stocks["600001"].issue_src == "infer" and up.stocks["600001"].issue_price == 3.0
+    assert up.stocks["000002"].issue_src == "f10"

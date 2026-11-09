@@ -1,3 +1,5 @@
-# 港股、美股数据源检查需要的额外依赖（只在 probe-global 时安装，不影响每日运行）
+# 港股、美股（Yahoo 历史行情、港交所 Excel 列表）
 yfinance>=1.0
 openpyxl
+pandas
+requests

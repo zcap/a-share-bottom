@@ -10,6 +10,9 @@ import shutil
 
 from .engine import Stock, board_of, compute_scores, is_pos, metric_value
 
+ISSUE_SRC_LABEL = {"em": "东方财富新股数据", "f10": "东方财富发行资料", "infer": "首日前收盘推断",
+                   "none": "换股/合并上市，无发行价"}
+
 # JSON 每行的字段顺序（网页按这个顺序读取）
 FIELDS = [
     "code", "mkt", "name", "board", "st", "list_date", "last_trade", "close", "hfq", "adj",
@@ -83,7 +86,7 @@ def export(stocks: dict[str, Stock], meta: dict, site_dir: str = "site", web_dir
                 round(m["low_now"], 3), m["low_date"], round(m["ratio_low"], 4), round((m["ratio_low"] - 1) * 100, 2),
                 round(m["close_now"], 3), m["close_date"], round(m["ratio_close"], 4),
                 s.issue_price if is_pos(s.issue_price) else "",
-                {"em": "东方财富", "infer": "首日前收盘推断"}.get(s.issue_src, ""), s.list_date,
+                ISSUE_SRC_LABEL.get(s.issue_src, ""), s.list_date,
                 *(("" if sc(s.code, k) is None else sc(s.code, k)) for k in ("total", "value", "quality", "growth")),
                 s.industry,
                 *(round(v, 2) if isinstance(v, float) and math.isfinite(v) else "" for v in (s.pe, s.pb, s.ps)),

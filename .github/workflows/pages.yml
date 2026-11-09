@@ -1,0 +1,57 @@
+name: 发布网页
+
+# 三个市场的更新任务完成后都会调用这里：取回 A 股、港股、美股各自的计算状态，生成整个网页并发布。
+# 也可以在 Actions 页面手动运行，只重新发布网页、不更新数据。
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    concurrency:
+      group: pages-build
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: 取回三个市场的计算状态
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          bash scripts/state.sh fetch data state
+          bash scripts/state.sh fetch data-hk state-hk
+          bash scripts/state.sh fetch data-us state-us
+
+      - name: 生成网页数据
+        run: python -m bottom site # 只用标准库，不需要安装依赖
+
+      - name: 打包网页
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    concurrency:
+      group: pages-deploy
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: 发布到 GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

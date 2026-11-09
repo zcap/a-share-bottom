@@ -39,7 +39,16 @@ body {
 }
 .wrap { max-width: 1320px; margin: 0 auto; padding: 0 16px; }
 
-.top { background: var(--panel); border-bottom: 1px solid var(--line); padding: 18px 0 14px; }
+.top { background: var(--panel); border-bottom: 1px solid var(--line); padding: 14px 0 14px; }
+.mkts { display: flex; gap: 4px; margin: 0 0 10px; }
+.mkts button {
+  font: inherit; font-size: 15px; font-weight: 600; padding: 5px 16px; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--muted);
+}
+.mkts button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+/* 只属于 A 股或港美股的控件、列、说明 */
+.intl .a-only, body:not(.intl) .intl-only { display: none; }
 h1 { margin: 0; font-size: 22px; letter-spacing: .5px; }
 .sub { margin: 2px 0 0; color: var(--muted); }
 .status { margin: 6px 0 0; font-size: 13px; color: var(--muted); }
@@ -91,6 +100,8 @@ tbody tr:hover { background: var(--accent-soft); }
 td a { color: var(--accent); text-decoration: none; }
 .hint { color: var(--muted); font-weight: 400; }
 .tag { display: inline-block; margin-left: 4px; padding: 0 5px; border-radius: 4px; background: var(--tag); color: var(--muted); font-size: 12px; }
+.tag.warn { background: var(--warn-bg); color: var(--warn-text); cursor: help; }
+.hint[title] { cursor: help; }
 .ratio { font-weight: 600; }
 .ratio.hot { color: var(--hot); }
 .pct { display: inline-flex; align-items: center; justify-content: flex-end; gap: 8px; }
@@ -111,7 +122,9 @@ td a { color: var(--accent); text-decoration: none; }
 .explain b { color: var(--text); }
 .foot { color: var(--muted); font-size: 12px; padding-bottom: 28px; }
 
-@media (max-width: 1400px) { .hide-l { display: none; } }
+/* 港美股没有评分列，发行价、上市日期在较窄的屏幕上也能显示 */
+@media (max-width: 1400px) { body:not(.intl) .hide-l { display: none; } }
+@media (max-width: 860px) { .intl .hide-l { display: none; } }
 @media (max-width: 860px) { .hide-m { display: none; } }
 @media (max-width: 760px) {
   .hide-s { display: none; }
@@ -120,6 +133,7 @@ td a { color: var(--accent); text-decoration: none; }
   .pct em { min-width: 0; }
   .dl { margin-left: 0; }
   h1 { font-size: 19px; }
+  .mkts button { padding: 4px 14px; font-size: 14px; }
   .sub { font-size: 13px; }
   .chips button, .buckets button { padding: 3px 10px; font-size: 13px; }
   .controls { gap: 8px; }

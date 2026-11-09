@@ -15,8 +15,9 @@ META_FILE = "meta.json"
 VERSION = 1
 
 
-def load(state_dir: str = STATE_DIR) -> tuple[dict[str, Stock], dict]:
-    stocks: dict[str, Stock] = {}
+def load(state_dir: str = STATE_DIR, cls=Stock) -> tuple[dict, dict]:
+    """读取状态。cls 是每行的类型（A 股 Stock，港美股 GStock）。"""
+    stocks: dict = {}
     meta: dict = {}
     mp = os.path.join(state_dir, META_FILE)
     sp = os.path.join(state_dir, STOCKS_FILE)
@@ -28,18 +29,19 @@ def load(state_dir: str = STATE_DIR) -> tuple[dict[str, Stock], dict]:
     if os.path.exists(sp):
         with gzip.open(sp, "rt", encoding="utf-8", newline="") as f:
             for rec in csv.DictReader(f):
-                s = Stock.from_record(rec)
+                s = cls.from_record(rec)
                 stocks[s.code] = s
     return stocks, meta
 
 
-def save(stocks: dict[str, Stock], meta: dict, state_dir: str = STATE_DIR) -> None:
+def save(stocks: dict, meta: dict, state_dir: str = STATE_DIR) -> None:
     os.makedirs(state_dir, exist_ok=True)
     meta = {**meta, "version": VERSION}
     sp = os.path.join(state_dir, STOCKS_FILE)
     tmp = sp + ".tmp"
     with gzip.open(tmp, "wt", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=Stock.columns())
+        cls = type(next(iter(stocks.values()))) if stocks else Stock
+        w = csv.DictWriter(f, fieldnames=cls.columns())
         w.writeheader()
         for code in sorted(stocks):
             w.writerow(stocks[code].to_record())

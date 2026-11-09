@@ -1,4 +1,4 @@
-name: 更新数据并发布网页
+name: A股：更新数据并发布网页
 
 on:
   schedule:
@@ -21,17 +21,17 @@ permissions:
   id-token: write
 
 concurrency:
-  group: update-data
+  group: update-a # 港股、美股是独立的任务，互不排队
   cancel-in-progress: false
 
 jobs:
   update:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 350
     outputs:
       mode: ${{ steps.mode.outputs.mode }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: 确定运行模式
         id: mode
@@ -51,7 +51,7 @@ jobs:
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
           echo "运行模式：$MODE"
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -88,20 +88,11 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: bash scripts/state.sh push
 
-      - name: 打包网页
-        if: "!startsWith(steps.mode.outputs.mode, 'probe')"
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: site
-
   deploy:
     needs: update
     if: "!startsWith(needs.update.outputs.mode, 'probe')"
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: 发布到 GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/pages.yml

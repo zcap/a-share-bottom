@@ -117,8 +117,9 @@ class FakeSources:
     """模拟 BaoStock / 腾讯 / 东方财富。"""
 
     def __init__(self, world: World, today_idx: int, bs_lag: int = 0, drop: set | None = None,
-                 em_prices: bool = True):
+                 em_prices: bool = True, f10: dict | None = None):
         self.w = world
+        self.f10 = f10  # 东方财富发行资料；None 表示获取失败
         self.today_idx = today_idx
         self.bs_lag = bs_lag  # BaoStock 入库延迟（天）
         self.drop = drop or set()  # (代码, 下标)：模拟全市场日线里缺了某只股票
@@ -240,6 +241,12 @@ class FakeSources:
             return {}
         # 只有 2 只有东方财富数据，其余靠首日前收盘价推断
         return {"688004": 50.0, "601006": 12.0, "920007": 9.0}
+
+    def issue_info_f10(self):
+        self.calls.append(("f10", None))
+        if self.f10 is None:
+            raise RuntimeError("模拟：发行资料无法访问")
+        return self.f10
 
     def close(self):
         pass

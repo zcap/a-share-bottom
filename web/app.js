@@ -1,34 +1,55 @@
 'use strict';
-/* A股 · 距历史最低 —— 读取 data/latest.json，在浏览器里按所选口径计算比值；
+/* 股票 · 距历史最低 —— 读取 data/*.json，在浏览器里按所选口径计算比值；
    可选从腾讯行情读取实时价（请求由你的浏览器直接发出）。 */
 
 const $ = (s) => document.querySelector(s);
 const PAGE = 100;
+const MK = {
+  a: {
+    label: 'A股', file: 'data/latest.json', csv: 'data/latest.csv', cur: '元', tz: 'Asia/Shanghai', open: '09:25', close: '15:05',
+    boards: ['沪主板', '深主板', '创业板', '科创板', '北交所'],
+    link: (r) => `https://gu.qq.com/${r.sym}`,
+  },
+  hk: {
+    label: '港股', file: 'data/hk.json', csv: 'data/hk.csv', cur: '港元', tz: 'Asia/Hong_Kong', open: '09:20', close: '16:15',
+    boards: ['主板', '创业板'],
+    link: (r) => `https://xueqiu.com/S/${r.code}`,
+  },
+  us: {
+    label: '美股', file: 'data/us.json', csv: 'data/us.csv', cur: '美元', tz: 'America/New_York', open: '09:25', close: '16:05',
+    boards: ['纳斯达克', '纽交所', 'NYSE American', '其他'],
+    link: (r) => `https://xueqiu.com/S/${r.code.replace('.', '-')}`,
+  },
+};
 const S = {
-  data: null, rows: [], view: [], shown: PAGE,
+  m: 'a', cache: {}, data: null, rows: [], view: [], shown: PAGE,
   sortKey: 'ratio', sortDir: 1,
   board: '', q: '', basis: 'low', useIssue: true, noST: false, noSusp: false, noDelist: false, maxRatio: null, minScore: null, scoreKey: 'tscore',
   rt: {}, rtTime: '', rtBusy: false, rtStale: false, rtTimer: null,
 };
+const intl = () => S.m !== 'a';
 
 // ---------- 工具 ----------
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-const fmtP = (x) => (x > 0 && isFinite(x) ? x.toFixed(x < 1 ? 3 : 2) : '—');
+const fmtP = (x) => (x > 0 && isFinite(x) ? x.toFixed(x >= 1 ? 2 : x >= 0.1 ? 3 : 4) : '—');
 const isNum = (x) => typeof x === 'number' && isFinite(x);
 const fmtPE = (x) => (!isNum(x) ? '<span class="dim">—</span>' : x < 0 ? '<span class="dim">亏损</span>' : x.toFixed(1));
 const fmtPB = (x) => (!isNum(x) ? '<span class="dim">—</span>' : x < 0 ? '<span class="dim">资不抵债</span>' : x.toFixed(2));
 function scoreCell(r, k, tip, cls) {
   const v = r[k];
-  return `<td class="num score${isNum(v) && v >= 80 ? ' good' : ''}${cls}" title="${esc(tip)}">${isNum(v) ? Math.round(v) : '<span class="dim">—</span>'}</td>`;
+  return `<td class="num score a-only${isNum(v) && v >= 80 ? ' good' : ''}${cls}" title="${esc(tip)}">${isNum(v) ? Math.round(v) : '<span class="dim">—</span>'}</td>`;
 }
 const DESC_FIRST = new Set(['tscore', 'vscore', 'qscore', 'gscore']); // 第一次点击就从高到低排
-function bjNow() {
-  const d = new Date(Date.now() + 8 * 3600 * 1000); // 用 UTC 字段读出北京时间
-  return { day: d.getUTCDay(), hm: d.toISOString().slice(11, 16) };
+function localNow(tz) {
+  // 用 Intl 读出某个时区的星期和时刻
+  const p = {};
+  for (const x of new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(new Date())) p[x.type] = x.value;
+  return { day: ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(p.weekday), hm: `${p.hour}:${p.minute}` };
 }
 function inTradingHours() {
-  const { day, hm } = bjNow();
-  return day >= 1 && day <= 5 && hm >= '09:25' && hm <= '15:05';
+  const c = MK[S.m];
+  const { day, hm } = localNow(c.tz);
+  return day >= 1 && day <= 5 && hm >= c.open && hm <= c.close;
 }
 function store(k, v) { try { localStorage.setItem('bottom.' + k, JSON.stringify(v)); } catch (e) { /* 忽略 */ } }
 function recall(k, dflt) {
@@ -41,12 +62,19 @@ function calc(r) {
   let adj = r.adj, cur = r.hfq, price = r.close, live = false, susp = r.last_trade < S.data.market_date;
   let baseL = r.min_low, dateL = r.min_low_date, baseC = r.min_close, dateC = r.min_close_date;
   if (q && q.date > r.last_trade) {
-    if (q.vol > 0 && q.price > 0) {
-      // 今天是除权除息日：前收盘价（参考价）和昨收换算后对不上，按后复权价连续重算因子
+    if (q.price > 0 && (q.vol > 0 || r.intl)) {
       const expected = r.hfq / r.adj;
-      if (q.pc > 0 && Math.abs(q.pc - expected) >= 0.005) adj = r.hfq / q.pc;
+      if (q.pc > 0) {
+        if (!r.intl && Math.abs(q.pc - expected) >= 0.005) {
+          // A 股除权除息日：前收盘价（参考价）和昨收换算后对不上，按复权价连续重算因子
+          adj = r.hfq / q.pc;
+        } else if (r.intl && Math.abs(q.pc / expected - 1) > 0.25) {
+          // 港美股交易所不调整分红的昨收，只有拆股、合股时昨收才会大幅变化
+          adj = r.hfq / q.pc;
+        }
+      }
       cur = q.price * adj; price = q.price; live = true; susp = false;
-      const todayLow = q.low > 0 ? q.low * adj : cur;
+      const todayLow = q.low > 0 ? Math.min(q.low, q.price) * adj : cur;
       if (todayLow < baseL) { baseL = todayLow; dateL = '今天'; }
       if (cur < baseC) { baseC = cur; dateC = '今天'; }
     } else {
@@ -55,7 +83,8 @@ function calc(r) {
   }
   let base = S.basis === 'low' ? baseL : baseC;
   let date = S.basis === 'low' ? dateL : dateC;
-  if (S.useIssue && r.issue_price > 0 && r.issue_price < base) { base = r.issue_price; date = '发行价'; }
+  const ic = r.intl ? r.issue_cmp : r.issue_price; // 港美股的发行价要先换算到今天口径
+  if (S.useIssue && ic > 0 && ic < base) { base = ic; date = '发行价'; }
   r.price = price; r.live = live; r.susp = susp;
   r.ratio = Math.max(1, cur / base); r.pct = (r.ratio - 1) * 100; // 当前价本身计入了最低，比值不会小于 1
   r.lowNow = base / adj; r.lowDate = date; r.ip = r.issue_price;
@@ -69,19 +98,27 @@ function cmp(a, b) {
   return String(x).localeCompare(String(y), 'zh-CN') * S.sortDir;
 }
 
+function boardOk(r) {
+  if (!S.board) return true;
+  if (S.board === '其他') return !MK[S.m].boards.includes(r.board);
+  return r.board === S.board;
+}
+
 function refresh() {
+  if (!S.data) return;
   for (const r of S.rows) calc(r);
   const q = S.q.trim().toLowerCase();
+  const a = !intl();
   const pre = S.rows.filter((r) =>
-    (!S.board || r.board === S.board) &&
-    (!q || r.code.startsWith(q) || r.name.toLowerCase().includes(q)) &&
-    (!S.noST || !r.st) &&
+    boardOk(r) &&
+    (!q || r.code.toLowerCase().startsWith(q) || r.name.toLowerCase().includes(q)) &&
+    (!a || !S.noST || !r.st) &&
     (!S.noSusp || !r.susp) &&
-    (!S.noDelist || !r.delisting));
+    (!a || !S.noDelist || !r.delisting));
   renderBuckets(pre);
   S.view = pre.filter((r) =>
     (!S.maxRatio || r.ratio <= S.maxRatio) &&
-    (S.minScore === null || (isNum(r[S.scoreKey]) && r[S.scoreKey] >= S.minScore))).sort(cmp);
+    (!a || S.minScore === null || (isNum(r[S.scoreKey]) && r[S.scoreKey] >= S.minScore))).sort(cmp);
   S.shown = PAGE;
   renderTable();
 }
@@ -97,30 +134,48 @@ function renderBuckets(rows) {
   $('#buckets').innerHTML = `<span>比值分布（共 <b>${rows.length}</b> 只）：</span>` + parts.join('');
 }
 
+const CUT_TIP = {
+  hk: '历史数据没有覆盖到上市日（Yahoo 的港股历史最早到 2000 年），只计算 2000 年以来的最低价',
+  us: '上市很早的老股票，Yahoo 的历史数据可能不是从上市日开始，只计算有数据以来的最低价',
+};
+const WARN_TIP = '历史中有单日涨跌超过 4 倍的情况，可能是拆股、合股没有复权，比值仅供参考';
+const ISSUE_SRC = { em: '东方财富', f10: '东方财富发行资料', infer: '首日前收盘价推断', nasdaq: '纳斯达克 IPO 日历' };
+
+function issueCell(r) {
+  if (r.issue_src === 'none') return '<span class="dim" title="换股吸收合并等方式上市，没有发行价">—</span>';
+  if (!(r.ip > 0)) return '<span class="dim">—</span>';
+  if (!r.intl) return fmtP(r.ip) + (r.issue_src === 'infer' ? '<span class="hint">†</span>' : '');
+  if (r.issue_cmp > 0) {
+    return `<span title="${esc(ISSUE_SRC[r.issue_src] || '')}；按今天价格口径 ${fmtP(r.issue_cmp)}">${fmtP(r.ip)}</span>`;
+  }
+  return `<span class="dim" title="没有计入：发行价和历史数据对不上（详见 CSV）">${fmtP(r.ip)}</span>`;
+}
+
 function renderTable() {
   const rows = S.view.slice(0, S.shown);
+  const link = MK[S.m].link;
   const html = rows.map((r) => {
     const w = Math.max(2, Math.min(60, (60 * Math.log(r.ratio)) / Math.log(5)));
     return `<tr>
-<td><a href="https://gu.qq.com/${r.sym}" target="_blank" rel="noopener">${r.code}</a></td>
-<td title="${esc(r.industry || '')}">${esc(r.name)}${r.susp ? '<span class="tag">停牌</span>' : ''}</td>
-<td class="hide-m dim">${r.board}</td>
+<td><a href="${link(r)}" target="_blank" rel="noopener">${esc(r.code)}</a></td>
+<td title="${esc(r.industry || '')}">${esc(r.name)}${r.susp ? '<span class="tag">停牌</span>' : ''}${r.warn ? `<span class="tag warn" title="${WARN_TIP}">⚠</span>` : ''}</td>
+<td class="hide-m dim">${esc(r.board)}</td>
 <td class="num${r.live ? ' live' : ''}">${fmtP(r.price)}</td>
 <td class="num hide-s">${fmtP(r.lowNow)}</td>
-<td class="hide-s dim">${esc(r.lowDate)}</td>
+<td class="hide-s dim">${esc(r.lowDate)}${r.hist_cut ? `<span class="hint" title="${CUT_TIP[S.m] || ''}"> ※</span>` : ''}</td>
 <td class="num ratio${r.ratio <= 1.1 ? ' hot' : ''}">${r.ratio.toFixed(3)}</td>
 <td class="num hide-s"><span class="pct"><span class="track"><i style="width:${w.toFixed(0)}px"></i></span><em>${r.pct.toFixed(1)}%</em></span></td>
 ${scoreCell(r, 'tscore', r.totTip, '')}
 ${scoreCell(r, 'vscore', r.valTip, ' hide-s')}
 ${scoreCell(r, 'qscore', r.qualTip, ' hide-s')}
 ${scoreCell(r, 'gscore', r.growTip, ' hide-s')}
-<td class="num hide-m">${fmtPE(r.pe)}</td>
-<td class="num hide-m">${fmtPB(r.pb)}</td>
-<td class="num hide-l">${r.ip > 0 ? fmtP(r.ip) + (r.issue_src === 'infer' ? '<span class="hint">†</span>' : '') : '<span class="dim">—</span>'}</td>
-<td class="hide-l dim">${r.list_date || ''}</td>
+<td class="num hide-m a-only">${fmtPE(r.pe)}</td>
+<td class="num hide-m a-only">${fmtPB(r.pb)}</td>
+<td class="num hide-l">${issueCell(r)}</td>
+<td class="hide-l dim">${r.list_date || '—'}</td>
 </tr>`;
   }).join('');
-  $('#tb').innerHTML = html || '<tr><td colspan="16" class="dim">没有符合条件的股票</td></tr>';
+  $('#tb').innerHTML = html || `<tr><td colspan="16" class="dim">${S.rows.length ? '没有符合条件的股票' : '暂无数据'}</td></tr>`;
   const btn = $('#moreBtn');
   btn.hidden = S.view.length <= S.shown;
   btn.textContent = `显示更多（还有 ${S.view.length - S.shown} 只）`;
@@ -148,7 +203,7 @@ function loadScript(syms) {
 function parseQuote(v) {
   const f = String(v).split('~');
   if (f.length < 35) return null;
-  const ts = f[30] || '';
+  const ts = (f[30] || '').replace(/\D/g, ''); // A 股 20261109150003；港股 2026/11/09 16:08:09；美股 2026-11-06 16:03:41
   return {
     price: +f[3], pc: +f[4], vol: +f[6], high: +f[33], low: +f[34],
     date: ts.length >= 8 ? `${ts.slice(0, 4)}-${ts.slice(4, 6)}-${ts.slice(6, 8)}` : '',
@@ -156,14 +211,30 @@ function parseQuote(v) {
   };
 }
 
+function takeQuote(sym) {
+  // 带点的美股代码（如 usBRK.B），返回的变量名里点可能是下划线
+  for (const key of ['v_' + sym, 'v_' + sym.replace(/\./g, '_')]) {
+    if (window[key] !== undefined) {
+      const q = parseQuote(window[key]);
+      try { delete window[key]; } catch (e) { window[key] = undefined; }
+      return q;
+    }
+  }
+  return null;
+}
+
 async function fetchRealtime() {
   if (S.rtBusy || !S.rows.length) return;
+  const m = S.m;
   S.rtBusy = true;
   const btn = $('#rtBtn'), st = $('#rtStatus');
   btn.disabled = true;
   const syms = S.rows.map((r) => r.sym);
+  // 带点的代码单独请求：万一返回的变量名不合法，不会连累同一批的其他股票
+  const plain = syms.filter((x) => !x.includes('.')), dotted = syms.filter((x) => x.includes('.'));
   const batches = [];
-  for (let i = 0; i < syms.length; i += 60) batches.push(syms.slice(i, i + 60));
+  for (let i = 0; i < plain.length; i += 60) batches.push(plain.slice(i, i + 60));
+  for (const x of dotted) batches.push([x]);
   const res = {};
   let done = 0, latest = '';
   st.textContent = '正在获取实时价…';
@@ -172,26 +243,26 @@ async function fetchRealtime() {
       const b = batches.shift();
       await loadScript(b);
       for (const sym of b) {
-        const key = 'v_' + sym;
-        if (window[key] !== undefined) {
-          const q = parseQuote(window[key]);
-          if (q && q.date) { res[sym] = q; if (q.date + q.time > latest) latest = q.date + ' ' + q.time; }
-          try { delete window[key]; } catch (e) { window[key] = undefined; }
-        }
+        const q = takeQuote(sym);
+        if (q && q.date) { res[sym] = q; if (q.date + q.time > latest) latest = q.date + ' ' + q.time; }
       }
       done += b.length;
       st.textContent = `正在获取实时价… ${Math.round((100 * done) / syms.length)}%`;
     }
   };
   await Promise.all(Array.from({ length: 6 }, worker));
+  S.rtBusy = false;
+  btn.disabled = false;
+  if (m !== S.m) return; // 获取期间切换了市场
 
   // 保护：收盘数据如果落后不止一天，昨收会和数据对不上，这时不使用实时价
   let n = 0, mism = 0;
   for (const r of S.rows) {
     const q = res[r.sym];
-    if (q && q.date > r.last_trade && q.vol > 0 && q.pc > 0) {
+    if (q && q.date > r.last_trade && q.price > 0 && q.pc > 0) {
       n++;
-      if (Math.abs(q.pc - r.hfq / r.adj) >= 0.005) mism++;
+      const exp = r.hfq / r.adj;
+      if (r.intl ? Math.abs(q.pc / exp - 1) >= 0.01 : Math.abs(q.pc - exp) >= 0.005) mism++;
     }
   }
   S.rtStale = n >= 50 && mism > 0.3 * n;
@@ -199,9 +270,7 @@ async function fetchRealtime() {
   const cnt = Object.keys(res).length;
   if (!cnt) st.textContent = '实时价获取失败（腾讯行情无法访问）';
   else if (S.rtStale) st.textContent = '收盘数据落后一天以上，暂不使用实时价';
-  else st.textContent = `实时价 ${latest.slice(5)}（腾讯行情，${cnt} 只）`;
-  S.rtBusy = false;
-  btn.disabled = false;
+  else st.textContent = `实时价 ${latest.slice(5)}（腾讯行情，${cnt} 只${intl() ? '，可能有延迟' : ''}）`;
   refresh();
 }
 
@@ -215,24 +284,17 @@ function setAuto(on) {
   }
 }
 
-// ---------- 初始化 ----------
-async function load() {
-  let data;
-  try {
-    const resp = await fetch('data/latest.json?t=' + Date.now(), { cache: 'no-store' });
-    data = await resp.json();
-  } catch (e) {
-    $('#status').textContent = '数据加载失败：可能还没有完成第一次数据构建，请稍后刷新。';
-    return;
-  }
-  S.data = data;
+// ---------- 数据 ----------
+function prepare(data, m) {
   const F = data.fields;
-  S.rows = data.rows.map((a) => {
+  return data.rows.map((a) => {
     const r = {};
     F.forEach((k, i) => { r[k] = a[i]; });
     r.sym = r.mkt + r.code;
+    r.intl = m !== 'a';
     r.st = !!r.st;
-    r.delisting = /退$|^退市/.test(r.name); // 退市整理期的股票名称以“退”结尾
+    r.delisting = !r.intl && /退$|^退市/.test(r.name); // 退市整理期的股票名称以“退”结尾
+    if (r.intl) return r;
     // 市盈率、市净率排序：亏损/资不抵债排在最后
     r.peSort = isNum(r.pe) ? (r.pe > 0 ? r.pe : 1e12) : null;
     r.pbSort = isNum(r.pb) ? (r.pb > 0 ? r.pb : 1e12) : null;
@@ -254,12 +316,63 @@ async function load() {
       : (noScore || '价值、质量、成长三项分数不全，暂无综合分');
     return r;
   });
-  $('#status').textContent =
-    `收盘数据 ${data.market_date} · ${S.rows.length} 只 · 更新于 ${data.updated_at}（北京时间）`;
-  if (data.build_pending && S.rows.length < data.total) { // 每周校正期间数据完整，不显示
+}
+
+async function loadMarket(m) {
+  if (S.cache[m]) return S.cache[m];
+  const resp = await fetch(MK[m].file + '?t=' + Date.now(), { cache: 'no-store' });
+  if (!resp.ok) throw new Error('HTTP ' + resp.status);
+  const data = await resp.json();
+  S.cache[m] = { data, rows: prepare(data, m) };
+  return S.cache[m];
+}
+
+function renderBoards() {
+  const c = MK[S.m];
+  $('#boards').innerHTML = ['', ...c.boards].map((b) =>
+    `<button data-board="${esc(b)}"${b === S.board ? ' class="on"' : ''}>${b || '全部'}</button>`).join('');
+}
+
+async function switchMarket(m, first = false) {
+  if (!MK[m]) m = 'a';
+  S.m = m;
+  store('market', m);
+  if (!first) history.replaceState(null, '', m === 'a' ? location.pathname + location.search : '#' + m);
+  document.body.classList.toggle('intl', m !== 'a');
+  document.querySelectorAll('#mkts button').forEach((b) => b.classList.toggle('on', b.dataset.m === m));
+  const c = MK[m];
+  $('#title').textContent = `${c.label} · 距历史最低`;
+  $('#csv').href = c.csv;
+  $('#note').textContent = m === 'a'
+    ? '* 历史最低价已换算成今天的价格口径（相当于等比前复权），可以直接和现价比较。† 发行价由上市首日前收盘价推断。'
+    : `* 历史最低价已换算成今天的价格口径，可以直接和现价比较。价格单位：${c.cur}。※ 历史数据没有覆盖到上市日。⚠ 数据可能有拆合股未复权。`;
+  S.board = '';
+  S.rt = {}; S.rtStale = false; $('#rtStatus').textContent = '';
+  S.sortKey = 'ratio'; S.sortDir = 1;
+  renderBoards();
+  $('#banner').hidden = true;
+  $('#status').textContent = '加载中…';
+  S.data = null; S.rows = [];
+  let got;
+  try {
+    got = await loadMarket(m);
+  } catch (e) {
+    if (S.m !== m) return;
+    $('#status').textContent = `${c.label}数据还没有生成（第一次运行完成后出现），请稍后刷新。`;
+    $('#buckets').innerHTML = '';
+    $('#tb').innerHTML = '<tr><td colspan="16" class="dim">暂无数据</td></tr>';
+    return;
+  }
+  if (S.m !== m) return;
+  S.data = got.data; S.rows = got.rows;
+  const d = got.data;
+  $('#status').textContent = d.rows.length
+    ? `收盘数据 ${d.market_date} · ${d.rows.length} 只 · 更新于 ${d.updated_at}（北京时间）${m === 'a' ? '' : ' · 单位：' + c.cur}`
+    : `${c.label}数据还没有生成（第一次运行完成后出现），请稍后刷新。`;
+  if (d.build_pending && S.rows.length < d.total) { // 每周校正期间数据完整，不显示
     const b = $('#banner');
     b.hidden = false;
-    b.textContent = `数据首次构建尚未完成（已完成 ${S.rows.length} / ${data.total} 只），后续运行会自动补齐。`;
+    b.textContent = `数据首次构建尚未完成（已完成 ${S.rows.length} / ${d.total} 只），后续运行会自动补齐。`;
   }
   refresh();
   if (inTradingHours()) fetchRealtime();
@@ -279,6 +392,14 @@ function bind() {
   $('#rtAuto').checked = recall('rtAuto', false);
   setAuto($('#rtAuto').checked);
 
+  $('#mkts').addEventListener('click', (e) => {
+    const b = e.target.closest('button');
+    if (b && b.dataset.m !== S.m) switchMarket(b.dataset.m);
+  });
+  window.addEventListener('hashchange', () => {
+    const m = location.hash.slice(1) || 'a';
+    if (MK[m] && m !== S.m) switchMarket(m, true);
+  });
   let t;
   $('#q').addEventListener('input', (e) => { clearTimeout(t); t = setTimeout(() => { S.q = e.target.value; refresh(); }, 150); });
   $('#boards').addEventListener('click', (e) => {
@@ -329,4 +450,4 @@ function bind() {
 }
 
 bind();
-load();
+switchMarket(MK[location.hash.slice(1)] ? location.hash.slice(1) : recall('market', 'a'), true);

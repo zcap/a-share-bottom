@@ -39,44 +39,11 @@ class Bar:
     traded: bool = True  # False 表示停牌
 
 
-@dataclass
-class Stock:
-    """一只股票的计算状态（每天增量更新，不需要保存全部历史）。"""
+class Record:
+    """一行状态的读写（保存成 CSV）。字段类型由 dataclass 的注解决定。"""
 
-    code: str  # 6 位代码
-    mkt: str  # sh / sz / bj
-    name: str = ""
-    list_date: str = ""  # 上市日期
-    is_st: bool = False
-    issue_price: float = math.nan  # 发行价
-    issue_src: str = ""  # em = 东方财富新股数据；infer = 上市首日前收盘价推断
-    ipo_preclose: float = math.nan  # 上市首日的前收盘价（交易所以发行价作为首日前收盘）
-    adj: float = 1.0  # 当前后复权因子
-    first_date: str = ""  # 数据里的第一根 K 线日期
-    last_seen: str = ""  # 已处理到的日期（含停牌日）
-    last_trade: str = ""  # 最后交易日
-    last_close: float = math.nan  # 最后交易日的不复权收盘价
-    last_adj: float = 1.0  # 最后交易日的复权因子（停牌期间除权时用来核对复牌日前收盘价）
-    min_low: float = math.inf  # 历史最低价（日内最低，后复权）
-    min_low_date: str = ""
-    min_close: float = math.inf  # 历史最低收盘价（后复权）
-    min_close_date: str = ""
-    built: str = ""  # 最近一次用完整历史重算的日期
-    n_events: int = 0  # 除权除息次数
-    pe: float = math.nan  # 市盈率（TTM）
-    pb: float = math.nan  # 市净率（MRQ）
-    ps: float = math.nan  # 市销率（TTM）
-    val_date: str = ""  # 估值数据日期
-    industry: str = ""  # 所处行业（东方财富行业分类）
-    roe: float = math.nan  # 净资产收益率 %（报告期累计）
-    gpm: float = math.nan  # 销售毛利率 %
-    ocfps: float = math.nan  # 每股经营现金流
-    bps: float = math.nan  # 每股净资产
-    rev_yoy: float = math.nan  # 营业总收入同比 %
-    np_yoy: float = math.nan  # 净利润同比 %
-    fin_period: str = ""  # 财务数据所属报告期
+    CODE_WIDTH = 0  # 代码不足这个长度时左边补 0（A 股 6 位）
 
-    # ---------- 序列化 ----------
     @classmethod
     def columns(cls) -> list[str]:
         return [f.name for f in fields(cls)]
@@ -108,10 +75,50 @@ class Stock:
                 v = str(v).strip().lower() in ("1", "true", "yes")
             else:
                 v = "" if v is None else str(v)
-                if f.name == "code":
-                    v = v.zfill(6)
+                if f.name == "code" and cls.CODE_WIDTH:
+                    v = v.zfill(cls.CODE_WIDTH)
             kwargs[f.name] = v
         return cls(**kwargs)
+
+
+@dataclass
+class Stock(Record):
+    """一只股票的计算状态（每天增量更新，不需要保存全部历史）。"""
+
+    CODE_WIDTH = 6
+
+    code: str  # 6 位代码
+    mkt: str  # sh / sz / bj
+    name: str = ""
+    list_date: str = ""  # 上市日期
+    is_st: bool = False
+    issue_price: float = math.nan  # 发行价
+    issue_src: str = ""  # em = 东方财富新股数据；f10 = 东方财富发行资料；infer = 首日前收盘价推断；none = 换股/合并上市，没有发行价
+    ipo_preclose: float = math.nan  # 上市首日的前收盘价（交易所以发行价作为首日前收盘）
+    adj: float = 1.0  # 当前后复权因子
+    first_date: str = ""  # 数据里的第一根 K 线日期
+    last_seen: str = ""  # 已处理到的日期（含停牌日）
+    last_trade: str = ""  # 最后交易日
+    last_close: float = math.nan  # 最后交易日的不复权收盘价
+    last_adj: float = 1.0  # 最后交易日的复权因子（停牌期间除权时用来核对复牌日前收盘价）
+    min_low: float = math.inf  # 历史最低价（日内最低，后复权）
+    min_low_date: str = ""
+    min_close: float = math.inf  # 历史最低收盘价（后复权）
+    min_close_date: str = ""
+    built: str = ""  # 最近一次用完整历史重算的日期
+    n_events: int = 0  # 除权除息次数
+    pe: float = math.nan  # 市盈率（TTM）
+    pb: float = math.nan  # 市净率（MRQ）
+    ps: float = math.nan  # 市销率（TTM）
+    val_date: str = ""  # 估值数据日期
+    industry: str = ""  # 所处行业（东方财富行业分类）
+    roe: float = math.nan  # 净资产收益率 %（报告期累计）
+    gpm: float = math.nan  # 销售毛利率 %
+    ocfps: float = math.nan  # 每股经营现金流
+    bps: float = math.nan  # 每股净资产
+    rev_yoy: float = math.nan  # 营业总收入同比 %
+    np_yoy: float = math.nan  # 净利润同比 %
+    fin_period: str = ""  # 财务数据所属报告期
 
     # ---------- 指标 ----------
     def close_hfq(self) -> float:
@@ -216,7 +223,11 @@ def rebuild_from_history(
 
 
 def fill_issue_price(s: Stock) -> None:
-    """没有正式发行价数据时，用上市首日前收盘价推断（交易所把发行价作为首日前收盘价）。"""
+    """没有正式发行价数据时，用上市首日前收盘价推断（交易所把发行价作为首日前收盘价）。
+
+    换股吸收合并等方式上市的（issue_src = none）首日前收盘价是换股参考价，不是发行价，不推断。"""
+    if s.issue_src == "none":
+        return
     if not is_pos(s.issue_price) and is_pos(s.ipo_preclose):
         s.issue_price = s.ipo_preclose
         s.issue_src = "infer"

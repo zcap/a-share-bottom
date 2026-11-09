@@ -1,0 +1,65 @@
+name: 美股：更新数据并发布网页
+
+on:
+  schedule:
+    # GitHub 的定时任务用 UTC 时间（北京时间 = UTC + 8），实际触发通常会晚十几到几十分钟
+    - cron: "40 22 * * 1-5" # 北京时间 周二至周六 06:40（纽约 17:40 / 夏令时 18:40，美股收盘后）
+    - cron: "40 1 * * 2-6" # 北京时间 周二至周六 09:40 再取一次：用稳定后的数据重算
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "运行模式：daily = 每日更新（Yahoo 没有新数据就跳过）；full = 强制重新下载全部历史并刷新发行价资料"
+        type: choice
+        options: [daily, full]
+        default: daily
+
+permissions:
+  contents: write # 保存计算状态到 data-us 分支
+  pages: write # 发布网页
+  id-token: write
+
+concurrency:
+  group: update-us
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-global.txt
+
+      - name: 安装依赖
+        run: pip install -r requirements-global.txt
+
+      - name: 取回上次的计算状态
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash scripts/state.sh pull data-us state
+
+      - name: 计算
+        env:
+          MODE: ${{ inputs.mode || 'daily' }}
+          TIME_BUDGET_MIN: "120" # 超过这个时间就保存进度，下次运行接着做
+          YF_WORKERS: "8" # Yahoo 并发下载数
+        run: python -m bottom us "$MODE"
+
+      - name: 保存计算状态
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash scripts/state.sh push data-us state
+
+  deploy:
+    needs: update
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/pages.yml

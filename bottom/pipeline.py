@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import datetime as dt
 import logging
 import multiprocessing as mp
 import os
@@ -29,6 +30,8 @@ FIN_REFRESH_DAYS = 7  # 财务数据（业绩报表）每隔几天重新取一�
 FIN_MIN_COVERAGE = 0.5  # 业绩报表覆盖的股票少于上市股票的一半，视为数据不完整
 FIN_PB_TOL = 0.10  # 用 收盘价/每股净资产 和 BaoStock 市净率核对，中位相对误差的上限
 COMPLETE_RATIO = 0.95  # BaoStock 全市场单日数据条数达到上市股票数的这个比例，才算当天已入库完整（停牌股也有记录）
+F10_REFRESH_DAYS = 7  # 东方财富发行资料每周刷新一次
+F10_MIN_RATIO, F10_MAX_RATIO = 0.05, 3.0  # 发行价 / 上市首日收盘价 的合理范围
 FACTOR_REL_TOL = 2e-4  # 每周核对时，复权因子相对误差超过它就重算
 
 
@@ -129,6 +132,11 @@ class Sources:
         from .src_other import issue_prices
 
         return issue_prices()
+
+    def issue_info_f10(self):
+        from .src_other import issue_info_f10
+
+        return issue_info_f10()
 
     def financials(self, period):
         from .src_other import financials
@@ -572,6 +580,9 @@ class Updater:
 
     # ---------- 发行价 ----------
     def update_issue_prices(self, force: bool = False) -> None:
+        """发行价来源优先级：东方财富新股数据（em）> 东方财富 F10 发行资料（f10）> 上市首日前收盘价推断（infer）。
+
+        换股吸收合并等方式上市的股票没有真正的发行价（issue_src = none），不计入历史最低。"""
         recent = add_days(self.today, -60)
         missing = [s for s in self.stocks.values() if s.issue_src != "em" and s.list_date >= recent]
         if force or missing:
@@ -583,9 +594,60 @@ class Updater:
                     s.issue_price, s.issue_src = p, "em"
                     n += 1
             if force:
-                self.note(f"发行价：东方财富数据匹配 {n} 只")
+                self.note(f"发行价：东方财富新股数据匹配 {n} 只")
+        last = self.meta.get("f10_issue_date", "")
+        pending = [s for s in self.stocks.values() if s.issue_src in ("", "infer") and s.list_date >= recent]
+        due = force or not last or last <= add_days(self.today, -F10_REFRESH_DAYS) or (pending and last != self.today)
+        if due:
+            try:
+                info = self.src.issue_info_f10()
+            except Exception as e:  # noqa: BLE001  只影响老股票发行价的来源，沿用原值
+                self.note(f"⚠️ 东方财富发行资料获取失败，发行价沿用原值：{type(e).__name__}: {e}")
+                info = None
+            if info is not None and self._apply_f10(info):
+                self.meta["f10_issue_date"] = self.today
         for s in self.stocks.values():
             fill_issue_price(s)
+
+    def _apply_f10(self, info: dict[str, dict]) -> bool:
+        if len(info) < 0.8 * len(self.stocks):
+            self.note(f"⚠️ 东方财富发行资料只有 {len(info)} 条（股票 {len(self.stocks)} 只），数据不完整，本次不使用")
+            return False
+        used = agree = bad = 0
+        diffs, swaps = [], []
+        for code, rec in info.items():
+            s = self.stocks.get(code)
+            if s is None or s.issue_src == "em":
+                continue
+            if rec.get("swap"):
+                s.issue_price, s.issue_src = math.nan, "none"
+                swaps.append(f"{s.code}{s.name}")
+                continue
+            p, fc = rec.get("price"), rec.get("first_close")
+            if not is_pos(p):
+                continue
+            ld = rec.get("list_date", "")
+            if ld and s.list_date and abs((dt.date.fromisoformat(ld) - dt.date.fromisoformat(s.list_date)).days) > 30:
+                bad += 1  # 上市日期对不上（代码可能被重复使用过）
+                continue
+            ref = fc if is_pos(fc) else s.ipo_preclose
+            if is_pos(ref) and not (F10_MIN_RATIO <= p / ref <= F10_MAX_RATIO):
+                bad += 1
+                continue
+            used += 1
+            if is_pos(s.ipo_preclose):
+                if abs(p - s.ipo_preclose) < 0.011:
+                    agree += 1
+                else:
+                    diffs.append(f"{s.code}{s.name} 发行资料 {p:g} / 首日前收盘 {s.ipo_preclose:g}")
+            s.issue_price, s.issue_src = p, "f10"
+        self.note(f"发行价（东方财富发行资料）：采用 {used} 只，其中和上市首日前收盘价一致 {agree} 只、不一致 {len(diffs)} 只；"
+                  f"换股/合并上市没有发行价 {len(swaps)} 只；数值或上市日期对不上、未采用 {bad} 只")
+        if diffs:
+            self.note("　不一致的（以发行资料为准）：" + "；".join(diffs[:10]) + (" 等" if len(diffs) > 10 else ""))
+        if swaps:
+            self.note("　换股/合并上市：" + "、".join(swaps[:10]) + (" 等" if len(swaps) > 10 else ""))
+        return True
 
     # ---------- 总入口 ----------
     def run(self, mode: str) -> None:
@@ -625,8 +687,10 @@ def report(up: Updater) -> None:
     for n in up.notes:
         summary(f"- {n}")
     summary(f"- 有数据的股票：{len(with_data)} / {len(up.stocks)}")
-    summary(f"- 发行价：东方财富 {sum(1 for s in stocks if s.issue_src == 'em')}，"
+    summary(f"- 发行价：东方财富新股数据 {sum(1 for s in stocks if s.issue_src == 'em')}，"
+            f"东方财富发行资料 {sum(1 for s in stocks if s.issue_src == 'f10')}，"
             f"首日前收盘推断 {sum(1 for s in stocks if s.issue_src == 'infer')}，"
+            f"换股/合并上市无发行价 {sum(1 for s in stocks if s.issue_src == 'none')}，"
             f"缺失 {sum(1 for s in stocks if not s.issue_src)}")
     if both:
         summary(f"- 校验：东方财富发行价与首日前收盘价一致 {agree}/{len(both)}")
