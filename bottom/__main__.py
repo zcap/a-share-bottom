@@ -4,6 +4,7 @@ python -m bottom daily     每日增量（没有历史状态时会自动先做�
 python -m bottom verify    每周核对：只核对复权因子，对不上的才重算（约 1 小时）
 python -m bottom rebuild   全量重建（每月一次，约 6 小时，分两次运行完成）
 python -m bottom probe     只检查各数据源能否访问，不改动数据
+python -m bottom probe-global  检查港股、美股及各市场发行价数据源（需先安装 requirements-global.txt）
 python -m bottom export    只用现有状态重新生成网页数据
 """
 
@@ -27,6 +28,10 @@ def main(argv: list[str]) -> int:
         from .probe import probe
 
         return probe()
+    if mode == "probe-global":
+        from .probe_global import probe_global
+
+        return probe_global()
 
     stocks, meta = store.load()
     if mode == "export":

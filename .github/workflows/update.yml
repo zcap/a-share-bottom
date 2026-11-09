@@ -10,9 +10,9 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "运行模式：daily = 每日更新；verify = 每周核对；rebuild = 完整重建；probe = 只检查数据源"
+        description: "运行模式：daily = 每日更新；verify = 每周核对；rebuild = 完整重建；probe = 检查 A 股数据源；probe-global = 检查港美股数据源"
         type: choice
-        options: [daily, verify, rebuild, probe]
+        options: [daily, verify, rebuild, probe, probe-global]
         default: daily
 
 permissions:
@@ -63,34 +63,40 @@ jobs:
         if: steps.mode.outputs.mode == 'probe'
         run: python -m bottom probe
 
+      - name: 检查港美股数据源
+        if: steps.mode.outputs.mode == 'probe-global'
+        run: |
+          pip install -r requirements-global.txt
+          python -m bottom probe-global
+
       - name: 取回上次的计算状态
-        if: steps.mode.outputs.mode != 'probe'
+        if: "!startsWith(steps.mode.outputs.mode, 'probe')"
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: bash scripts/state.sh pull
 
       - name: 计算
-        if: steps.mode.outputs.mode != 'probe'
+        if: "!startsWith(steps.mode.outputs.mode, 'probe')"
         env:
           TIME_BUDGET_MIN: "300" # 超过 5 小时就保存进度，下次运行接着做
           BS_WORKERS: "4" # BaoStock 并行下载进程数
         run: python -m bottom "${{ steps.mode.outputs.mode }}"
 
       - name: 保存计算状态
-        if: always() && steps.mode.outputs.mode != 'probe'
+        if: "always() && !startsWith(steps.mode.outputs.mode, 'probe')"
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: bash scripts/state.sh push
 
       - name: 打包网页
-        if: steps.mode.outputs.mode != 'probe'
+        if: "!startsWith(steps.mode.outputs.mode, 'probe')"
         uses: actions/upload-pages-artifact@v3
         with:
           path: site
 
   deploy:
     needs: update
-    if: needs.update.outputs.mode != 'probe'
+    if: "!startsWith(needs.update.outputs.mode, 'probe')"
     runs-on: ubuntu-latest
     environment:
       name: github-pages
