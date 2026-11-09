@@ -93,7 +93,10 @@ def parse_nasdaq_files(texts: list[str]) -> dict[str, dict]:
             if US_EXCLUDE.search(name):
                 continue
             exch = d.get("Exchange", "Q")  # nasdaqlisted.txt 没有交易所列，都是纳斯达克
-            out[sym] = {"name_en": clean_us_name(name), "board": US_BOARD.get(exch, "其他"), "fund": is_fund(name)}
+            # 用去掉后缀的名称判断基金：纳斯达克给业务发展公司（BDC，如 Ares Capital）加了“- Closed End Fund”后缀，
+            # 但它们是放贷的经营性公司，按股票保留；名称本身带 Fund 的封闭式基金仍然排除
+            base = clean_us_name(name)
+            out[sym] = {"name_en": base, "board": US_BOARD.get(exch, "其他"), "fund": is_fund(base)}
     return out
 
 
@@ -187,7 +190,15 @@ def yahoo_history(sym: str, period: str = "max", timeout: int = 30):
     t = yf.Ticker(sym)
     # 时区是已知的：预先填上，yfinance 就不用为每只股票多发一次查询时区的请求（请求数减半，更不容易被限流）
     t._tz = yahoo_tz(sym)
-    df = t.history(period=period, interval="1d", auto_adjust=False, actions=True, timeout=timeout)
+    from yfinance.exceptions import YFInvalidPeriodError
+
+    try:
+        df = t.history(period=period, interval="1d", auto_adjust=False, actions=True, timeout=timeout)
+    except YFInvalidPeriodError:
+        # 刚上市几天的股票，Yahoo 只接受 1d/5d 这类区间：改用起始日期取，结果同样是全部历史
+        if period != "max":
+            raise
+        df = t.history(start="1970-01-02", interval="1d", auto_adjust=False, actions=True, timeout=timeout)
     return frame_to_bars(df)
 
 

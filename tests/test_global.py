@@ -158,6 +158,8 @@ def test_parse_nasdaq_files():
               "ZXZZT|NASDAQ TEST STOCK|G|Y|N|100|N|N\n"
               "ABCDW|ABCD Corp - Warrants|S|N|N|100|N|N\n"
               "BABA|Alibaba Group Holding Limited American Depositary Shares each representing eight Ordinary share|Q|N|N|100|N|N\n"
+              "ARCC|Ares Capital Corporation - Closed End Fund|Q|N|N|100|N|N\n"
+              "CHI|Calamos Convertible Opportunities and Income Fund - Closed End Fund|Q|N|N|100|N|N\n"
               "File Creation Time: 1109202608:00|||||||\n")
     other = ("ACT Symbol|Security Name|Exchange|CQS Symbol|ETF|Round Lot Size|Test Issue|NASDAQ Symbol\n"
              "BRK.B|Berkshire Hathaway Inc. Class B|N|BRKb|N|100|N|BRK.B\n"
@@ -168,7 +170,8 @@ def test_parse_nasdaq_files():
              "IEP|Icahn Enterprises L.P. - Depositary units|Q|IEP|N|100|N|IEP\n"
              "File Creation Time: 1109202608:00|||||||\n")
     got = parse_nasdaq_files([nasdaq, other])
-    assert set(got) == {"AAPL", "BABA", "BRK.B", "PDI", "ET", "IEP"}
+    assert set(got) == {"AAPL", "BABA", "BRK.B", "PDI", "ET", "IEP", "ARCC", "CHI"}
+    assert not got["ARCC"]["fund"] and got["CHI"]["fund"]  # 业务发展公司保留，封闭式基金排除
     assert got["ET"]["name_en"] == "Energy Transfer LP"
     assert got["AAPL"] == {"name_en": "Apple Inc.", "board": "纳斯达克", "fund": False}
     assert got["BRK.B"]["board"] == "纽交所" and got["PDI"]["fund"]

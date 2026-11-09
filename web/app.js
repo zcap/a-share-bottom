@@ -342,6 +342,7 @@ async function switchMarket(m, first = false) {
   document.querySelectorAll('#mkts button').forEach((b) => b.classList.toggle('on', b.dataset.m === m));
   const c = MK[m];
   $('#title').textContent = `${c.label} · 距历史最低`;
+  document.title = `${c.label} · 距历史最低`;
   $('#csv').href = c.csv;
   $('#note').textContent = m === 'a'
     ? '* 历史最低价已换算成今天的价格口径（相当于等比前复权），可以直接和现价比较。† 发行价由上市首日前收盘价推断。'
