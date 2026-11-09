@@ -24,7 +24,7 @@ const MK = {
 const S = {
   m: 'a', cache: {}, data: null, rows: [], view: [], shown: PAGE,
   sortKey: 'ratio', sortDir: 1,
-  board: '', q: '', basis: 'low', useIssue: true, noST: false, noSusp: false, noDelist: false, maxRatio: null, minScore: null, scoreKey: 'tscore',
+  board: '', q: '', basis: 'low', useIssue: true, noST: false, noSusp: false, noDelist: false, maxRatio: null, minScore: null, scoreKey: 'tscore', minCap: 0,
   rt: {}, rtTime: '', rtBusy: false, rtStale: false, rtTimer: null,
 };
 const intl = () => S.m !== 'a';
@@ -35,9 +35,15 @@ const fmtP = (x) => (x > 0 && isFinite(x) ? x.toFixed(x >= 1 ? 2 : x >= 0.1 ? 3 
 const isNum = (x) => typeof x === 'number' && isFinite(x);
 const fmtPE = (x) => (!isNum(x) ? '<span class="dim">—</span>' : x < 0 ? '<span class="dim">亏损</span>' : x.toFixed(1));
 const fmtPB = (x) => (!isNum(x) ? '<span class="dim">—</span>' : x < 0 ? '<span class="dim">资不抵债</span>' : x.toFixed(2));
+function fmtCap(x) { // 总市值：亿 / 万亿
+  if (!isNum(x) || x <= 0) return '<span class="dim">—</span>';
+  if (x >= 1e12) return (x / 1e12).toFixed(2) + '万亿';
+  if (x >= 1e8) return (x / 1e8).toFixed(x >= 1e10 ? 0 : 1) + '亿';
+  return (x / 1e4).toFixed(0) + '万';
+}
 function scoreCell(r, k, tip, cls) {
   const v = r[k];
-  return `<td class="num score a-only${isNum(v) && v >= 80 ? ' good' : ''}${cls}" title="${esc(tip)}">${isNum(v) ? Math.round(v) : '<span class="dim">—</span>'}</td>`;
+  return `<td class="num score${isNum(v) && v >= 80 ? ' good' : ''}${cls}" title="${esc(tip)}">${isNum(v) ? Math.round(v) : '<span class="dim">—</span>'}</td>`;
 }
 const DESC_FIRST = new Set(['tscore', 'vscore', 'qscore', 'gscore']); // 第一次点击就从高到低排
 function localNow(tz) {
@@ -118,7 +124,8 @@ function refresh() {
   renderBuckets(pre);
   S.view = pre.filter((r) =>
     (!S.maxRatio || r.ratio <= S.maxRatio) &&
-    (!a || S.minScore === null || (isNum(r[S.scoreKey]) && r[S.scoreKey] >= S.minScore))).sort(cmp);
+    (S.minScore === null || (isNum(r[S.scoreKey]) && r[S.scoreKey] >= S.minScore)) &&
+    (a || !S.minCap || (isNum(r.mcap) && r.mcap >= S.minCap))).sort(cmp);
   S.shown = PAGE;
   renderTable();
 }
@@ -169,13 +176,14 @@ ${scoreCell(r, 'tscore', r.totTip, '')}
 ${scoreCell(r, 'vscore', r.valTip, ' hide-s')}
 ${scoreCell(r, 'qscore', r.qualTip, ' hide-s')}
 ${scoreCell(r, 'gscore', r.growTip, ' hide-s')}
-<td class="num hide-m a-only">${fmtPE(r.pe)}</td>
-<td class="num hide-m a-only">${fmtPB(r.pb)}</td>
+<td class="num hide-m">${fmtPE(r.pe)}</td>
+<td class="num hide-m">${fmtPB(r.pb)}</td>
+<td class="num hide-m intl-only">${fmtCap(r.mcap)}</td>
 <td class="num hide-l">${issueCell(r)}</td>
 <td class="hide-l dim">${r.list_date || '—'}</td>
 </tr>`;
   }).join('');
-  $('#tb').innerHTML = html || `<tr><td colspan="16" class="dim">${S.rows.length ? '没有符合条件的股票' : '暂无数据'}</td></tr>`;
+  $('#tb').innerHTML = html || `<tr><td colspan="17" class="dim">${S.rows.length ? '没有符合条件的股票' : '暂无数据'}</td></tr>`;
   const btn = $('#moreBtn');
   btn.hidden = S.view.length <= S.shown;
   btn.textContent = `显示更多（还有 ${S.view.length - S.shown} 只）`;
@@ -294,11 +302,29 @@ function prepare(data, m) {
     r.intl = m !== 'a';
     r.st = !!r.st;
     r.delisting = !r.intl && /退$|^退市/.test(r.name); // 退市整理期的股票名称以“退”结尾
-    if (r.intl) return r;
     // 市盈率、市净率排序：亏损/资不抵债排在最后
     r.peSort = isNum(r.pe) ? (r.pe > 0 ? r.pe : 1e12) : null;
     r.pbSort = isNum(r.pb) ? (r.pb > 0 ? r.pb : 1e12) : null;
     const part = (label, v, d, u = '') => `${label} ${isNum(v) ? v.toFixed(d) + u : '—'}`;
+    if (r.intl) {
+      const ind = r.industry ? `行业：${r.sector ? r.sector + ' / ' : ''}${r.industry}（同行业不足 8 只时与同大类比较，再不够与全市场比较）`
+        : '无行业信息，与全市场比较';
+      const noFin = r.val_date ? null : '估值与财务数据还没取到（每次运行取一部分，一周内取完）';
+      r.valTip = isNum(r.vscore)
+        ? `${part('市盈率TTM', r.pe, 1)} · ${part('市净率', r.pb, 2)} · ${part('市销率TTM', r.ps, 2)} · ${part('股息率', r.dy, 2, '%')}（${r.val_date}）\n${ind}`
+        : (noFin || '估值数据不足，暂无价值分');
+      r.qualTip = isNum(r.qscore)
+        ? `${part('净资产收益率', r.roe, 1, '%')} · ${part('毛利率', r.gpm, 1, '%')} · ${part('经营现金流/净资产', r.cfroe, 1, '%')}（最近 12 个月）\n${ind}`
+        : (noFin || '没有可比的财务数据，暂无质量分');
+      r.growTip = isNum(r.gscore)
+        ? `${part('营收同比', r.rev_yoy, 1, '%')} · ${part('盈利同比', r.np_yoy, 1, '%')}（最近一个季度和去年同期比）\n${ind}`
+        : (noFin || '没有可比的财务数据，暂无成长分');
+      r.totTip = isNum(r.tscore)
+        ? `价值 ${Math.round(r.vscore)} × 50% + 质量 ${Math.round(r.qscore)} × 30% + 成长 ${Math.round(r.gscore)} × 20%\n${ind}`
+        : (noFin || '价值、质量、成长三项分数不全，暂无综合分');
+      r.industry = r.industry ? `${r.sector ? r.sector + ' / ' : ''}${r.industry}` : '';
+      return r;
+    }
     const ind = r.industry ? `与「${r.industry}」行业内比较` : '无行业信息，与全市场比较';
     const fp = r.fin_period ? `${r.fin_period} 财报` : '';
     const noScore = r.delisting ? '退市整理期，不参与评分' : null;
@@ -361,7 +387,7 @@ async function switchMarket(m, first = false) {
     if (S.m !== m) return;
     $('#status').textContent = `${c.label}数据还没有生成（第一次运行完成后出现），请稍后刷新。`;
     $('#buckets').innerHTML = '';
-    $('#tb').innerHTML = '<tr><td colspan="16" class="dim">暂无数据</td></tr>';
+    $('#tb').innerHTML = '<tr><td colspan="17" class="dim">暂无数据</td></tr>';
     return;
   }
   if (S.m !== m) return;
@@ -423,6 +449,7 @@ function bind() {
     refresh();
   });
   $('#scoreKey').addEventListener('change', (e) => { S.scoreKey = e.target.value; refresh(); });
+  $('#minCap').addEventListener('change', (e) => { S.minCap = +e.target.value || 0; refresh(); });
   $('#minScore').addEventListener('input', (e) => {
     const v = parseFloat(e.target.value);
     S.minScore = v >= 0 ? v : null;

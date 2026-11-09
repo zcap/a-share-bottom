@@ -66,9 +66,31 @@ class GStock(Record):
     excluded: str = ""  # spac / fund：不显示
     fetched: str = ""  # 最近一次成功下载的日期
     fails: int = 0  # 连续下载失败次数
+    # ---- 估值与财务（Yahoo，每周刷新；比率都是无单位的，避免报表币种和交易币种不同的问题）----
+    sector: str = ""  # Yahoo 板块（11 个大类）
+    industry: str = ""  # Yahoo 行业（约 150 个细分）
+    pe: float = math.nan  # 市盈率 TTM（= 股价 ÷ 每股收益，亏损为负）
+    pb: float = math.nan  # 市净率（净资产为负时为空）
+    ps: float = math.nan  # 市销率 TTM
+    dy: float = math.nan  # 股息率 %（最近 12 个月分红 ÷ 现价，用 Yahoo 历史里的分红算）
+    roe: float = math.nan  # 净资产收益率 %（TTM）
+    gpm: float = math.nan  # 毛利率 %
+    cfroe: float = math.nan  # 经营现金流 ÷ 净资产 %
+    rev_yoy: float = math.nan  # 营收同比 %（最近一个季度）
+    np_yoy: float = math.nan  # 盈利同比 %（最近一个季度）
+    mcap: float = math.nan  # 取数时的总市值（交易币种）
+    mcap_px: float = math.nan  # 取数时的股价（用来按最新收盘价换算市值）
+    fin_date: str = ""  # 最近一次取估值与财务数据的日期
+    fin_fails: int = 0
 
     def has_data(self) -> bool:
         return is_pos(self.last_close) and math.isfinite(self.min_low)
+
+    def mcap_now(self) -> float:
+        """按最新收盘价换算的总市值。"""
+        if is_pos(self.mcap) and is_pos(self.mcap_px) and is_pos(self.last_close):
+            return self.mcap * self.last_close / self.mcap_px
+        return math.nan
 
     def ratio(self, use_issue: bool = True) -> float:
         base = self.min_low
@@ -81,14 +103,18 @@ JUMP = 4.0  # 单日涨跌超过 4 倍视为可疑跳变
 LOW_FIX = 0.5  # 最低价比开盘、收盘中较低者还低一半以上，视为错误成交，改用开盘/收盘中较低者
 ISSUE_RANGE = {"hk": (0.2, 3.0), "us": (0.1, 3.0)}  # 发行价 ÷ 上市首日收盘价 的合理范围
 ISSUE_DAYS = (-3, 10)  # 数据第一天 − 上市日（或定价日）的允许天数
+DY_MAX = 25.0  # 股息率上限（%）
 
 
 def _days(a: str, b: str) -> int:
     return (dt.date.fromisoformat(a) - dt.date.fromisoformat(b)).days
 
 
-def compute(s: GStock, bars: list[YBar], splits: list[tuple[str, float]], n_divs: int, cutoff: str) -> bool:
-    """用完整历史重算一只股票。cutoff 之后的 K 线（盘中未收盘）不计入。没有有效数据返回 False，状态不变。"""
+def compute(s: GStock, bars: list[YBar], splits: list[tuple[str, float]], divs: list[tuple[str, float]],
+            cutoff: str) -> bool:
+    """用完整历史重算一只股票。cutoff 之后的 K 线（盘中未收盘）不计入。没有有效数据返回 False，状态不变。
+
+    divs：Yahoo 历史里的分红 [(除息日, 每股金额)]，金额已按拆合股调整到今天口径。"""
     bars = [b for b in bars if b.date <= cutoff and is_pos(b.close) and is_pos(b.adjclose)]
     if not bars:
         return False
@@ -117,7 +143,12 @@ def compute(s: GStock, bars: list[YBar], splits: list[tuple[str, float]], n_divs
     s.min_low, s.min_low_date = min_low * k, min_low_date
     s.min_close, s.min_close_date = min_close * k, min_close_date
     s.n_splits = sum(1 for d, r in splits if d <= cutoff and is_pos(r) and r != 1)
-    s.n_divs, s.n_fix, s.jump_date = n_divs, n_fix, jump
+    divs = [(d, a) for d, a in divs if d <= cutoff and is_pos(a)]
+    s.n_divs, s.n_fix, s.jump_date = len(divs), n_fix, jump
+    # 股息率：最近 12 个月的分红 ÷ 最新收盘价（同一价格口径）；超过 25% 多是特别分红，不计
+    year_ago = (dt.date.fromisoformat(last.date) - dt.timedelta(days=365)).isoformat()
+    dy = 100 * sum(a for d, a in divs if d > year_ago) / last.close
+    s.dy = dy if dy <= DY_MAX else math.nan
     s.issue_cmp, s.issue_note = math.nan, ""
     if is_pos(s.issue_price):
         convert_issue(s, bars[0], splits, k)
@@ -224,3 +255,113 @@ def hist_cut(s: GStock) -> bool:
     if s.list_date:
         return _days(s.first_date, s.list_date) > ISSUE_DAYS[1]
     return s.first_date <= HIST_START.get(s.mkt, "")
+
+
+# ---------------- 估值与财务（Yahoo 的 info） ----------------
+MARKET_CURRENCY = {"hk": "HKD", "us": "USD"}
+SECTOR_CN = {
+    "Technology": "科技", "Financial Services": "金融", "Healthcare": "医疗保健", "Consumer Cyclical": "可选消费",
+    "Consumer Defensive": "必需消费", "Industrials": "工业", "Basic Materials": "原材料", "Energy": "能源",
+    "Utilities": "公用事业", "Real Estate": "房地产", "Communication Services": "通信服务",
+}
+PS_CHECK_TOL = 0.3  # Yahoo 市销率和“市盈率 × 净利率”推算值相差超过三成时，用推算值
+
+
+def _num(x) -> float:
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return math.nan
+    return v if math.isfinite(v) else math.nan
+
+
+def _in(v: float, lo: float, hi: float) -> float:
+    return v if math.isfinite(v) and lo <= v <= hi else math.nan
+
+
+def apply_info(s: GStock, info: dict, today: str) -> list[str]:
+    """把 Yahoo 的 info 写进状态，返回核对时发现的问题（用于统计）。
+
+    只用无单位的比率或同一币种的数：
+    * 市盈率 = 股价 ÷ 每股收益（Yahoo 的每股收益已换算成交易币种；亏损时为负，排名时排最差）；
+    * 市销率：报表币种和交易币种不同时，Yahoo 的市销率不一定换算过，用“市盈率 × 净利率”核对；
+    * 经营现金流 ÷ 净资产：净资产 = 净利润 ÷ 净资产收益率，三者都是报表币种。"""
+    flags: list[str] = []
+    cur = str(info.get("currency") or "").upper()
+    fin_cur = str(info.get("financialCurrency") or cur).upper()
+    s.sector = str(info.get("sector") or "").strip()
+    s.industry = str(info.get("industry") or "").strip()
+    s.fin_date = today
+    price = _num(info.get("currentPrice")) if is_pos(_num(info.get("currentPrice"))) else _num(info.get("regularMarketPrice"))
+    s.mcap, s.mcap_px = _num(info.get("marketCap")), price
+    for k in ("pe", "pb", "ps", "roe", "gpm", "cfroe", "rev_yoy", "np_yoy"):
+        setattr(s, k, math.nan)
+    if cur and cur != MARKET_CURRENCY.get(s.mkt, cur):
+        flags.append("交易币种不符")  # 比如美元柜台，价格和市值口径不一致，估值不用
+        s.mcap = math.nan
+    else:
+        eps, ype = _num(info.get("trailingEps")), _num(info.get("trailingPE"))
+        if is_pos(price) and math.isfinite(eps) and eps != 0:
+            pe = price / eps
+            if is_pos(ype) and abs(pe / ype - 1) > 0.05:
+                flags.append("每股收益和市盈率对不上")
+                pe = ype
+            s.pe = pe if abs(pe) <= 5000 else math.nan
+        elif is_pos(ype):
+            s.pe = ype
+        pb = _num(info.get("priceToBook"))
+        s.pb = pb if is_pos(pb) and pb <= 1000 else math.nan  # 净资产为负（大额回购）时视为缺失，不当成最便宜
+        ps = _in(_num(info.get("priceToSalesTrailing12Months")), 1e-6, 1000)
+        margin = _num(info.get("profitMargins"))
+        if is_pos(s.pe) and is_pos(margin):
+            implied = s.pe * margin
+            if math.isfinite(ps) and abs(ps / implied - 1) > PS_CHECK_TOL:
+                flags.append("市销率改用推算值")
+                ps = implied
+            elif not math.isfinite(ps):
+                ps = implied
+        elif fin_cur != cur and math.isfinite(ps):
+            flags.append("币种不同、市销率无法核对")
+            ps = math.nan
+        s.ps = ps
+    roe = _num(info.get("returnOnEquity"))
+    s.roe = _in(roe * 100, -500, 500)
+    gm = _num(info.get("grossMargins"))
+    s.gpm = _in(gm * 100, -500, 100) if gm != 0 else math.nan  # 银行等没有毛利率，Yahoo 给 0
+    ni, ocf = _num(info.get("netIncomeToCommon")), _num(info.get("operatingCashflow"))
+    if math.isfinite(roe) and roe != 0 and math.isfinite(ni) and ni != 0 and math.isfinite(ocf):
+        equity = ni / roe
+        if equity > 0:
+            s.cfroe = _in(100 * ocf / equity, -1000, 1000)
+    s.rev_yoy = _in(_num(info.get("revenueGrowth")) * 100, -100, 10000)
+    s.np_yoy = _in(_num(info.get("earningsGrowth")) * 100, -10000, 100000)
+    return flags
+
+
+def metric_value_g(s: GStock, name: str) -> float:
+    """港美股评分指标（越大越好）。"""
+    if name == "ep":
+        return 1.0 / s.pe if math.isfinite(s.pe) and s.pe != 0 else math.nan
+    if name == "bp":
+        return 1.0 / s.pb if is_pos(s.pb) else math.nan
+    if name == "sp":
+        return 1.0 / s.ps if is_pos(s.ps) else math.nan
+    v = getattr(s, name)
+    return v if isinstance(v, (int, float)) and math.isfinite(v) else math.nan
+
+
+G_SCORE_DEFS = {
+    # 价值：盈利收益率、账面市值比、销售市值比、股息率（港股高股息特征明显，所以加入股息率）
+    "value": (("ep", "bp", "sp", "dy"), 2),
+    "quality": (("roe", "gpm", "cfroe"), 2),
+    "growth": (("rev_yoy", "np_yoy"), 1),
+}
+
+
+def g_scores(stocks) -> dict[str, dict[str, float]]:
+    """港美股评分：先比同行业，行业太小用同板块，再不够用全市场。没有估值财务数据的不参与。"""
+    from .engine import compute_scores
+
+    pool = [s for s in stocks if s.has_data() and not s.excluded and s.fin_date]
+    return compute_scores(pool, defs=G_SCORE_DEFS, metric=metric_value_g, group_keys=("sector", "industry"),
+                          exclude=lambda s: False)

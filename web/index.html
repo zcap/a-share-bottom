@@ -39,12 +39,21 @@
       <label class="chk"><input type="checkbox" id="noSusp"> 排除停牌</label>
       <label class="chk a-only"><input type="checkbox" id="noDelist"> 排除退市整理</label>
       <label>比值 ≤ <input id="maxRatio" type="number" min="1" step="0.05" placeholder="不限" inputmode="decimal"></label>
-      <label class="a-only"><select id="scoreKey" aria-label="分数类型">
+      <label><select id="scoreKey" aria-label="分数类型">
           <option value="tscore">综合分</option>
           <option value="vscore">价值分</option>
           <option value="qscore">质量分</option>
           <option value="gscore">成长分</option>
         </select> ≥ <input id="minScore" type="number" min="0" max="100" step="5" placeholder="不限" inputmode="numeric"></label>
+      <label class="intl-only">市值 ≥
+        <select id="minCap">
+          <option value="0">不限</option>
+          <option value="1e8">1 亿</option>
+          <option value="1e9">10 亿</option>
+          <option value="1e10">100 亿</option>
+          <option value="1e11">1000 亿</option>
+        </select>
+      </label>
     </div>
     <div class="row">
       <button id="rtBtn" class="primary">获取实时价</button>
@@ -68,12 +77,13 @@
           <th data-k="lowDate" class="hide-s">最低日期</th>
           <th data-k="ratio" class="num sorted asc">比值</th>
           <th data-k="pct" class="num hide-s">距最低</th>
-          <th data-k="tscore" class="num a-only" title="价值 50% + 质量 30% + 成长 20%，0–100">综合</th>
-          <th data-k="vscore" class="num hide-s a-only" title="同行业内比较，越高越便宜">价值</th>
-          <th data-k="qscore" class="num hide-s a-only" title="同行业内比较：净资产收益率、毛利率、经营现金流/净资产">质量</th>
-          <th data-k="gscore" class="num hide-s a-only" title="同行业内比较：营收同比、净利润同比">成长</th>
-          <th data-k="peSort" class="num hide-m a-only">市盈率</th>
-          <th data-k="pbSort" class="num hide-m a-only">市净率</th>
+          <th data-k="tscore" class="num" title="价值 50% + 质量 30% + 成长 20%，0–100">综合</th>
+          <th data-k="vscore" class="num hide-s" title="同行业内比较，越高越便宜">价值</th>
+          <th data-k="qscore" class="num hide-s" title="同行业内比较：净资产收益率、毛利率、经营现金流/净资产">质量</th>
+          <th data-k="gscore" class="num hide-s" title="同行业内比较：营收同比、净利润同比">成长</th>
+          <th data-k="peSort" class="num hide-m">市盈率</th>
+          <th data-k="pbSort" class="num hide-m">市净率</th>
+          <th data-k="mcap" class="num hide-m intl-only" title="按最新收盘价换算，单位为当地货币">市值</th>
           <th data-k="ip" class="num hide-l">发行价</th>
           <th data-k="list_date" class="hide-l">上市日期</th>
         </tr>
@@ -114,7 +124,11 @@
       <li><b>美股范围</b>：纳斯达克、纽交所等交易所上市的普通股和 ADR，不含 ETF、优先股、权证、封闭式基金，也不含并购前的 SPAC 空壳（股价一直在 10 美元附近）。</li>
       <li><b>港股范围</b>：主板和创业板的股本证券，不含人民币柜台、权证、牛熊证、ETF 等。</li>
       <li><b>实时价</b>：来自腾讯行情，可能有延迟；除息日当天的比值要等收盘后的数据才完全准确。</li>
-      <li><b>评分</b>：港股、美股的价值、质量、成长分将在下一步加入。</li>
+      <li><b>评分</b>：和 A 股一样分价值、质量、成长、综合四个分数（0–100，越高越好），数据来自 Yahoo，每只股票每周更新一次。先在同行业（Yahoo 的细分行业）内比较；同行业不足 8 只时与同一大类比较，再不够与全市场比较。港股、美股分开比较。</li>
+      <li><b>价值分</b>：市盈率（TTM）、市净率、市销率（TTM）取倒数，再加上<b>股息率</b>（最近 12 个月分红 ÷ 现价），四项至少有两项才给分。亏损的市盈率排最差；<b>净资产为负</b>（美股常见于大额回购，如麦当劳）时市净率按缺失处理，不当成最便宜。</li>
+      <li><b>质量分</b>：净资产收益率、毛利率、经营现金流 ÷ 净资产（最近 12 个月）；<b>成长分</b>：最近一个季度的营收、盈利和去年同期比。和 A 股不同，港美股不用统一的报告期，因为各公司的财年和披露频率不一样（港股多为半年报）。</li>
+      <li><b>币种</b>：很多港股、中概股用人民币出报表、用港元或美元交易。评分只用没有单位的比率；报表和交易币种不同时，市销率用“市盈率 × 净利率”核对，核对不了就不用。</li>
+      <li><b>市值</b>：按最新收盘价换算，单位是当地货币。评分不设市值门槛，可以用“市值 ≥”筛掉小公司。</li>
     </ul>
   </details>
 </main>

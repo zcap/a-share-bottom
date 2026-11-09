@@ -145,10 +145,10 @@ def yahoo_symbol(mkt: str, code: str) -> str:
     return f"{int(code):04d}.HK" if mkt == "hk" else code.replace(".", "-")
 
 
-def frame_to_bars(df) -> tuple[list[YBar], list[tuple[str, float]], int]:
-    """yfinance 的 DataFrame → (K 线, 拆合股 [(日期, 倍数)], 分红次数)。同一天出现两行时保留后一行。"""
+def frame_to_bars(df) -> tuple[list[YBar], list[tuple[str, float]], list[tuple[str, float]]]:
+    """yfinance 的 DataFrame → (K 线, 拆合股 [(日期, 倍数)], 分红 [(除息日, 每股金额)])。同一天出现两行时保留后一行。"""
     if df is None or len(df) == 0:
-        return [], [], 0
+        return [], [], []
     cols = set(df.columns)
     dates = [ts.strftime("%Y-%m-%d") for ts in df.index]
 
@@ -162,15 +162,15 @@ def frame_to_bars(df) -> tuple[list[YBar], list[tuple[str, float]], int]:
     sp, dv = col("Stock Splits", [0.0] * len(dates)), col("Dividends", [0.0] * len(dates))
     by_date: dict[str, YBar] = {}
     splits: dict[str, float] = {}
-    n_div = 0
+    divs: dict[str, float] = {}
     for i, d in enumerate(dates):
         by_date[d] = YBar(d, o[i], h[i], lo[i], c[i], a[i])
         if math.isfinite(sp[i]) and sp[i] > 0 and sp[i] != 1:
             splits[d] = sp[i]
         if math.isfinite(dv[i]) and dv[i] > 0:
-            n_div += 1
+            divs[d] = dv[i]
     bars = [by_date[d] for d in sorted(by_date)]
-    return bars, sorted(splits.items()), n_div
+    return bars, sorted(splits.items()), sorted(divs.items())
 
 
 def _yf():
@@ -205,9 +205,15 @@ def yahoo_history(sym: str, period: str = "max", timeout: int = 30):
 RATE_LIMIT_STOP = 40  # 累计被限流这么多次就停止，剩下的沿用上次结果
 
 
-def yahoo_histories(items: list[tuple[str, str]], workers: int = 8, deadline: float | None = None
-                    ) -> Iterator[tuple[str, tuple | None, str]]:
-    """并发下载完整历史。items = [(代码, Yahoo 代码)]；逐只产出 (代码, (K线, 拆合股, 分红次数) 或 None, 错误说明)。"""
+class NoData(Exception):
+    """Yahoo 上没有这只股票的数据（退市、代码不存在等）。"""
+
+
+def _parallel(items: list[tuple[str, str]], fetch, workers: int, deadline: float | None, what: str
+              ) -> Iterator[tuple[str, object | None, str]]:
+    """并发请求 Yahoo。fetch(Yahoo 代码) 返回结果或抛异常；逐只产出 (代码, 结果 或 None, 错误说明)。
+
+    被限流时退避重试，累计限流 RATE_LIMIT_STOP 次就停止，剩下的留给下次运行（沿用上次的结果）。"""
     from yfinance.exceptions import (YFPricesMissingError, YFRateLimitError, YFTickerMissingError,
                                      YFTzMissingError)
 
@@ -219,19 +225,16 @@ def yahoo_histories(items: list[tuple[str, str]], workers: int = 8, deadline: fl
     def one(code: str, sym: str):
         for attempt in range(4):
             if stop.is_set() or (deadline and time.time() > deadline):
-                return code, None, "未下载（时间用完或被限流）"
+                return code, None, "未请求（时间用完或被限流）"
             try:
-                bars, splits, n_div = yahoo_history(sym)
-                if not bars:
-                    return code, None, "没有数据"
-                return code, (bars, splits, n_div), ""
+                return code, fetch(sym), ""
             except YFRateLimitError:
                 with lock:
                     limited[0] += 1
                     if limited[0] >= RATE_LIMIT_STOP:
                         stop.set()
                 time.sleep(20 * (attempt + 1) + random.random() * 10)
-            except (YFPricesMissingError, YFTzMissingError, YFTickerMissingError) as e:
+            except (NoData, YFPricesMissingError, YFTzMissingError, YFTickerMissingError) as e:
                 # 退市、代码在 Yahoo 上不存在；网络抖动时也会表现成这样，所以再试一次
                 if attempt >= 1:
                     return code, None, f"没有数据：{str(e)[:80]}"
@@ -247,7 +250,70 @@ def yahoo_histories(items: list[tuple[str, str]], workers: int = 8, deadline: fl
         for fut in as_completed(futs):
             yield fut.result()
     if limited[0]:
-        log.warning("Yahoo 限流 %d 次%s", limited[0], "，已提前停止" if stop.is_set() else "")
+        log.warning("Yahoo %s 限流 %d 次%s", what, limited[0], "，已提前停止" if stop.is_set() else "")
+
+
+def _history_or_nodata(sym: str):
+    bars, splits, divs = yahoo_history(sym)
+    if not bars:
+        raise NoData(sym)
+    return bars, splits, divs
+
+
+def yahoo_histories(items: list[tuple[str, str]], workers: int = 8, deadline: float | None = None
+                    ) -> Iterator[tuple[str, tuple | None, str]]:
+    """并发下载完整历史。items = [(代码, Yahoo 代码)]；逐只产出 (代码, (K线, 拆合股, 分红) 或 None, 错误说明)。"""
+    return _parallel(items, _history_or_nodata, workers, deadline, "历史行情")
+
+
+# Yahoo 的 quoteSummary：一次请求取估值、财务、行业（yfinance 的 info 要发 3 次请求，这里只取需要的模块）
+QS_URL = "https://query2.finance.yahoo.com/v10/finance/quoteSummary/"
+QS_MODULES = "financialData,defaultKeyStatistics,summaryDetail,assetProfile,price"
+
+
+def flatten_summary(res: dict) -> dict:
+    """quoteSummary 的结果按模块嵌套，摊平成一层；同名字段以靠前的模块为准。"""
+    out: dict = {}
+    for mod in QS_MODULES.split(","):
+        d = res.get(mod)
+        if not isinstance(d, dict):
+            continue
+        for k, v in d.items():
+            if isinstance(v, dict):
+                v = v.get("raw")
+            if k not in out and v is not None:
+                out[k] = v
+    return out
+
+
+def yahoo_info(sym: str, timeout: int = 30) -> dict:
+    yf = _yf()
+    try:
+        from yfinance.data import YfData
+
+        params = {"modules": QS_MODULES, "formatted": "false", "corsDomain": "finance.yahoo.com", "symbol": sym,
+                  "lang": "en-US", "region": "US"}
+        j = YfData().get_raw_json(QS_URL + sym, params=params, timeout=timeout)
+    except (ImportError, AttributeError, TypeError):
+        # yfinance 内部接口变了：退回公开的 get_info()（多发两次请求，但结果一样）
+        info = yf.Ticker(sym).get_info() or {}
+        if not info.get("currency"):
+            raise NoData(sym)
+        return info
+    except Exception as e:  # noqa: BLE001
+        if "404" in str(e):
+            raise NoData(sym) from e
+        raise
+    res = ((j.get("quoteSummary") or {}).get("result") or [None])[0]
+    if not res:
+        raise NoData(sym)
+    return flatten_summary(res)
+
+
+def yahoo_infos(items: list[tuple[str, str]], workers: int = 4, deadline: float | None = None
+                ) -> Iterator[tuple[str, dict | None, str]]:
+    """并发取估值与财务。逐只产出 (代码, info 或 None, 错误说明)。"""
+    return _parallel(items, yahoo_info, workers, deadline, "估值财务")
 
 
 def latest_bar_date(syms: list[str]) -> str:

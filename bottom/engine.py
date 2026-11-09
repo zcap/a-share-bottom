@@ -308,34 +308,42 @@ def is_delisting(name: str) -> bool:
     return bool(re.search(r"退$|^退市", n))
 
 
-def compute_scores(stocks) -> dict[str, dict[str, float]]:
+def compute_scores(stocks, defs=None, metric=None, group_keys=("industry",), exclude=None
+                   ) -> dict[str, dict[str, float]]:
     """{代码: {value, quality, growth, total}}，各项 0–100，越高越好；缺的项不出现。
 
     同行业内比较，避免银行、地产这类天然低估值的行业永远“便宜”；
-    行业太小或没有行业信息时，改为和全市场比较。
+    行业太小或没有行业信息时，改为和全市场比较。group_keys 从粗到细（如 板块、行业），
+    每只股票用它所在的、股票数达到 MIN_GROUP 的最细一级分组。
     退市整理期的股票不参与评分：股价已经崩塌，估值指标失去意义，也不占同行业的排名。"""
-    stocks = [s for s in stocks if s.has_data() and not is_delisting(s.name)]
+    defs = defs or SCORE_DEFS
+    metric = metric or metric_value
+    exclude = exclude or (lambda s: is_delisting(s.name))
+    stocks = [s for s in stocks if s.has_data() and not exclude(s)]
     pct: dict[str, dict[str, float]] = {}
-    metrics = {m for ms, _ in SCORE_DEFS.values() for m in ms}
+    metrics = {m for ms, _ in defs.values() for m in ms}
     for m in metrics:
-        allv, groups = [], {}
+        allv = []
+        groups: dict[str, dict[str, list]] = {k: {} for k in group_keys}
         for s in stocks:
-            v = metric_value(s, m)
+            v = metric(s, m)
             if math.isfinite(v):
                 allv.append((v, s.code))
-                if s.industry:
-                    groups.setdefault(s.industry, []).append((v, s.code))
-        market = _percentiles(allv)
-        for code, p in market.items():
+                for k in group_keys:
+                    g = getattr(s, k, "")
+                    if g:
+                        groups[k].setdefault(g, []).append((v, s.code))
+        for code, p in _percentiles(allv).items():
             pct.setdefault(code, {})[m] = p
-        for items in groups.values():
-            if len(items) >= MIN_GROUP:
-                for code, p in _percentiles(items).items():
-                    pct[code][m] = p
+        for k in group_keys:  # 从粗到细，细的覆盖粗的
+            for items in groups[k].values():
+                if len(items) >= MIN_GROUP:
+                    for code, p in _percentiles(items).items():
+                        pct[code][m] = p
     out: dict[str, dict[str, float]] = {}
     for code, d in pct.items():
         sc = {}
-        for name, (ms, need) in SCORE_DEFS.items():
+        for name, (ms, need) in defs.items():
             vals = [d[m] for m in ms if m in d]
             if len(vals) >= need:
                 sc[name] = 100.0 * sum(vals) / len(vals)

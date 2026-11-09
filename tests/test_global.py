@@ -75,7 +75,7 @@ def test_compute_matches_hfq_truth():
     dates = days(len(RAW))
     bars, splits = yahoo_from_raw(dates, RAW, EVENTS)
     s = GStock(code="00001", mkt="hk", issue_price=9.6, issue_date=dates[0])
-    assert compute(s, bars, splits, 1, cutoff=dates[-1])
+    assert compute(s, bars, splits, [(dates[5], 0.15)], cutoff=dates[-1])
     assert s.ratio(use_issue=False) == pytest.approx(hfq_truth(RAW, EVENTS), rel=1e-9)
     assert s.ratio() == pytest.approx(hfq_truth(RAW, EVENTS, issue=9.6), rel=1e-9)
     assert s.last_close == pytest.approx(4.5) and s.n_splits == 1 and s.n_divs == 1
@@ -87,7 +87,7 @@ def test_cutoff_ignores_intraday_bar():
     dates = days(len(RAW))
     bars, splits = yahoo_from_raw(dates, RAW, EVENTS)
     s = GStock(code="X", mkt="us")
-    compute(s, bars, splits, 1, cutoff=dates[-2])
+    compute(s, bars, splits, [], cutoff=dates[-2])
     assert s.last_trade == dates[-2] and s.last_close == pytest.approx(4.1)
 
 
@@ -96,10 +96,10 @@ def test_bad_low_repaired_and_jump_flagged():
     bars = [YBar(d, 10, 10.5, 9.5, 10, 10) for d in dates]
     bars[2] = YBar(dates[2], 10, 10.5, 0.01, 10, 10)  # 错误成交
     s = GStock(code="X", mkt="us")
-    compute(s, bars, [], 0, dates[-1])
+    compute(s, bars, [], [], dates[-1])
     assert s.n_fix == 1 and s.min_low == pytest.approx(9.5)
     bars[3] = YBar(dates[3], 50, 50, 50, 50, 50)  # 拆合股没有复权造成的跳变
-    compute(s, bars, [], 0, dates[-1])
+    compute(s, bars, [], [], dates[-1])
     assert s.jump_date == dates[4]  # 50 → 10 也是跳变，记最近一次
 
 
@@ -107,17 +107,17 @@ def test_issue_checks():
     dates = days(5, "2020-03-02")
     bars = [YBar(d, 20, 21, 19, 20, 20) for d in dates]
     s = GStock(code="X", mkt="us", issue_price=18.0, issue_date="2020-02-28")  # 定价日在周五，周一上市
-    compute(s, bars, [], 0, dates[-1])
+    compute(s, bars, [], [], dates[-1])
     assert s.issue_cmp == pytest.approx(18.0) and not s.issue_note
     s = GStock(code="X", mkt="us", issue_price=18.0, issue_date="2015-06-01")  # 代码被重复使用
-    compute(s, bars, [], 0, dates[-1])
+    compute(s, bars, [], [], dates[-1])
     assert math.isnan(s.issue_cmp) and "对不上" in s.issue_note
     s = GStock(code="X", mkt="hk", issue_price=180.0, issue_date=dates[0])  # 数值不合理
-    compute(s, bars, [], 0, dates[-1])
+    compute(s, bars, [], [], dates[-1])
     assert math.isnan(s.issue_cmp) and "相差过大" in s.issue_note
     # 上市后 1 拆 5：首日收盘 100（不复权）→ Yahoo 显示 20；招股价 80 换算后 16
     s = GStock(code="X", mkt="hk", issue_price=80.0, issue_date=dates[0])
-    compute(s, bars, [("2024-05-15", 5.0)], 0, dates[-1])
+    compute(s, bars, [("2024-05-15", 5.0)], [], dates[-1])
     assert s.issue_cmp == pytest.approx(16.0)
 
 
@@ -221,7 +221,7 @@ def test_frame_to_bars():
                        "Stock Splits": [0, 0, 0, 2.0]}, index=idx)
     bars, splits, n_div = frame_to_bars(df)
     assert [b.date for b in bars] == ["2024-01-02", "2024-01-03", "2024-01-04"]
-    assert bars[1].close == 2.1 and splits == [("2024-01-04", 2.0)] and n_div == 2
+    assert bars[1].close == 2.1 and splits == [("2024-01-04", 2.0)] and n_div == [("2024-01-03", 0.1)]
 
 
 def test_cutoff_date():
@@ -260,7 +260,7 @@ class FakeGlobal:
                 continue
             raw = self.raw(code)
             bars, splits = yahoo_from_raw(self.dates[: len(raw)], raw, {10: ("split", 2.0), 20: ("div", 0.3)})
-            yield code, (bars, splits, 1), ""
+            yield code, (bars, splits, [(self.dates[20], 0.3)]), ""
 
     def latest_date(self):
         return self.dates[self.last_idx]
@@ -275,6 +275,21 @@ class FakeGlobal:
     def us_ipo_month(self, ym):
         self.calls.append(("ipo", ym))
         return [{"sym": "S1", "price": 9.0, "date": "2024-02-29", "name": "S1 Corp"}] if ym == "2024-02" else []
+
+    def infos(self, items, workers, deadline):
+        self.calls.append(("infos", len(items)))
+        for i, (code, _sym) in enumerate(items):
+            if code in self.fail:
+                yield code, None, "没有数据：x"
+                continue
+            k = i % 9
+            yield code, {"currency": "HKD" if self.mkt == "hk" else "USD", "financialCurrency": "CNY",
+                         "currentPrice": 10.0, "trailingEps": 0.5 + 0.1 * k, "trailingPE": 10.0 / (0.5 + 0.1 * k),
+                         "priceToBook": 1 + 0.2 * k, "priceToSalesTrailing12Months": 2.0, "profitMargins": 0.1,
+                         "returnOnEquity": 0.05 + 0.01 * k, "grossMargins": 0.3, "netIncomeToCommon": 100.0,
+                         "operatingCashflow": 120.0, "revenueGrowth": 0.1 * k, "earningsGrowth": -0.05 * k,
+                         "marketCap": 1e10, "sector": "Technology" if k % 2 else "Industrials",
+                         "industry": f"Ind {k % 3}"}, ""
 
 
 def run_g(src, d, idx_now, mode="daily"):
@@ -380,3 +395,106 @@ def test_retry_redownloads_until_settled(tmp_path):
     assert run_at("17:40") == 2  # 再跑一次仍然下载
     assert run_at("21:10") == 3  # 晚上补跑：下载并标记为稳定
     assert run_at("21:40") == 3  # 之后没有新数据就跳过
+
+
+# ---------------- 估值与财务、评分 ----------------
+def _info(**kw):
+    base = {"currency": "USD", "financialCurrency": "USD", "currentPrice": 100.0, "trailingEps": 5.0, "trailingPE": 20.0,
+            "priceToBook": 3.0, "priceToSalesTrailing12Months": 2.0, "profitMargins": 0.1, "returnOnEquity": 0.15,
+            "grossMargins": 0.4, "netIncomeToCommon": 150.0, "operatingCashflow": 200.0, "revenueGrowth": 0.08,
+            "earningsGrowth": 0.12, "marketCap": 1e9, "sector": "Technology", "industry": "Software"}
+    base.update(kw)
+    return base
+
+
+def test_apply_info_basic_and_checks():
+    from bottom.gengine import apply_info, metric_value_g
+
+    s = GStock(code="X", mkt="us", last_close=100.0)
+    assert apply_info(s, _info(), "2026-11-09") == []
+    assert (s.pe, s.pb, s.ps) == (20.0, 3.0, 2.0)
+    assert s.roe == pytest.approx(15) and s.gpm == pytest.approx(40) and s.rev_yoy == pytest.approx(8)
+    assert s.cfroe == pytest.approx(200 / (150 / 0.15) * 100)  # 经营现金流 / (净利润 / ROE)
+    # 亏损：Yahoo 不给市盈率，用每股收益算出负的市盈率，排名时排最差
+    s2 = GStock(code="Y", mkt="us")
+    apply_info(s2, _info(trailingEps=-2.0, trailingPE=None, profitMargins=-0.1), "2026-11-09")
+    assert s2.pe == pytest.approx(-50) and metric_value_g(s2, "ep") < 0
+    # 负净资产（大额回购）：市净率、ROE 视为缺失，而不是最便宜
+    s3 = GStock(code="Z", mkt="us")
+    apply_info(s3, _info(priceToBook=-568.9, returnOnEquity=None), "2026-11-09")
+    assert math.isnan(s3.pb) and math.isnan(s3.roe) and math.isnan(s3.cfroe)
+    # ADR：报表币种人民币，Yahoo 市销率没换算（小了约 7 倍）→ 用 市盈率 × 净利率 推算
+    s4 = GStock(code="BABA", mkt="us")
+    flags = apply_info(s4, _info(financialCurrency="CNY", priceToSalesTrailing12Months=0.28), "2026-11-09")
+    assert s4.ps == pytest.approx(2.0) and "市销率改用推算值" in flags
+    # 亏损的 ADR：市销率无法核对，不用
+    s5 = GStock(code="ADR", mkt="us")
+    flags = apply_info(s5, _info(financialCurrency="CNY", trailingEps=-1, trailingPE=None, profitMargins=-0.2), "2026-11-09")
+    assert math.isnan(s5.ps) and "币种不同、市销率无法核对" in flags
+    # 交易币种不对（如美元柜台）：估值不用
+    s6 = GStock(code="00001", mkt="hk")
+    flags = apply_info(s6, _info(), "2026-11-09")
+    assert "交易币种不符" in flags and math.isnan(s6.pe) and math.isnan(s6.mcap)
+    # 银行没有毛利率（Yahoo 给 0）→ 缺失
+    s7 = GStock(code="B", mkt="us")
+    apply_info(s7, _info(grossMargins=0), "2026-11-09")
+    assert math.isnan(s7.gpm)
+
+
+def test_dividend_yield_from_history():
+    dates = days(300, "2025-01-02")
+    bars = [YBar(d, 10, 10, 10, 10, 10) for d in dates]
+    s = GStock(code="X", mkt="hk")
+    compute(s, bars, [], [("2025-01-10", 9.0), (dates[150], 0.2), (dates[250], 0.3)], dates[-1])
+    assert s.dy == pytest.approx(5.0) and s.n_divs == 3  # 一年以前的那次不算
+    compute(s, bars, [], [(dates[250], 3.0)], dates[-1])
+    assert math.isnan(s.dy)  # 超过 25%（特别分红）不计
+
+
+def test_g_scores_group_fallback():
+    from bottom.gengine import g_scores
+
+    stocks = []
+    for i in range(30):
+        st = GStock(code=f"{i:05d}", mkt="hk", last_close=10, min_low=5, fin_date="2026-11-09",
+                    sector="Technology" if i < 20 else "Energy", industry="Software" if i < 10 else f"Misc{i}",
+                    pe=5 + i, pb=1 + i / 10, dy=float(i % 5), roe=float(i), gpm=30.0, rev_yoy=float(i))
+        stocks.append(st)
+    stocks.append(GStock(code="99999", mkt="hk", last_close=10, min_low=5))  # 没有估值财务数据：不参与
+    sc = g_scores(stocks)
+    assert "99999" not in sc
+    assert all(k in sc["00000"] for k in ("value", "quality", "growth", "total"))
+    # 00000 在软件行业（10 只）里市盈率最低、ROE 最低
+    assert sc["00000"]["value"] > sc["00009"]["value"]
+    assert sc["00009"]["quality"] > sc["00000"]["quality"]
+
+
+def test_fundamentals_in_pipeline(tmp_path):
+    import bottom.gpipeline as gp
+
+    d = str(tmp_path / "state")
+    src = FakeGlobal("hk", n=20)
+    up = run_g(src, d, 40)
+    assert ("infos", 20) in src.calls
+    s = up.stocks["00001"]
+    assert s.fin_date and math.isfinite(s.pe) and s.sector
+    assert any("估值与财务" in n and "20 / 20" in n for n in up.notes)
+    # 一周内不重复取；超过一周再取
+    n = len(src.calls)
+    run_g(src, d, 41)
+    assert not any(c[0] == "infos" for c in src.calls[n:])
+    stocks, meta = store.load(d, cls=GStock)
+    for st in stocks.values():
+        st.fin_date = "2024-01-01"
+    store.save(stocks, meta, d)
+    run_g(src, d, 42)
+    assert src.calls[-1] == ("infos", 20)
+    # 导出带评分
+    site = str(tmp_path / "site")
+    stocks, meta = store.load(d, cls=GStock)
+    export_market("hk", stocks, meta, site)
+    doc = json.load(open(os.path.join(site, "data", "hk.json"), encoding="utf-8"))
+    rows = [dict(zip(doc["fields"], r)) for r in doc["rows"]]
+    assert all(r["tscore"] is not None for r in rows)
+    assert rows[0]["sector"] in ("科技", "工业") and rows[0]["mcap"] > 0
+    assert gp.FUND_MAX_MIN > 0

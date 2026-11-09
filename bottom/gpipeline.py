@@ -12,12 +12,16 @@ import os
 import time
 from collections import Counter
 
-from .gengine import GStock, choose_ipo, compute, cutoff_date, hist_cut, is_pos, settled, spac_like
+from .gengine import (GStock, apply_info, choose_ipo, compute, cutoff_date, g_scores, hist_cut, is_pos, settled,
+                      spac_like)
 from .util import add_days, bj_now, summary
 
 LIST_GUARD = 0.9  # 官方列表比上次少一成以上时，认为列表不完整，不删除股票
 COMPLETE_RATIO = 0.95  # 下载成功比例达到它才算“全部完成”
 EM_REFRESH_DAYS = 7  # 港股招股价资料每周刷新
+FUND_REFRESH_DAYS = 7  # 估值与财务数据每只股票每周刷新一次
+FUND_MAX_MIN = 15  # 每次运行取估值与财务最多用几分钟，没取完的下次接着取
+FUND_WORKERS = 4  # 估值与财务的并发数（比历史行情少，Yahoo 对这个接口限流更严）
 IPO_BACKFILL_FROM = "2000-01"  # 美股 IPO 日历最早回溯到这个月（纳斯达克大约从 2000 年前后开始有数据）
 IPO_BACKFILL_MIN = 12  # 每次运行回溯 IPO 日历最多用几分钟（第一次运行约需 15 分钟，会分两次完成）
 BENCH = {"hk": ["0700.HK", "0005.HK"], "us": ["AAPL", "MSFT"]}
@@ -60,6 +64,11 @@ class GlobalSources:
         from .src_global import us_ipo_month
 
         return us_ipo_month(ym)
+
+    def infos(self, items, workers, deadline):
+        from .src_global import yahoo_infos
+
+        return yahoo_infos(items, workers=workers, deadline=deadline)
 
 
 def _months(start: str, end: str) -> list[str]:
@@ -240,10 +249,10 @@ class GlobalUpdater:
                 errors[err.split("：")[0]] += 1
                 failed.append(code)
                 continue
-            bars, splits, n_div = res
+            bars, splits, divs = res
             if self.mkt == "us":
                 self._match_ipo(s, bars, cutoff)
-            if not compute(s, bars, splits, n_div, cutoff):
+            if not compute(s, bars, splits, divs, cutoff):
                 s.fails += 1
                 errors["没有有效数据"] += 1
                 failed.append(code)
@@ -300,6 +309,48 @@ class GlobalUpdater:
                 msg = "⚠️ " + msg + "，一致比例偏低，请检查数据"
         self.note(msg)
 
+    # ---------- 估值与财务 ----------
+    def refresh_fundamentals(self, force: bool = False) -> None:
+        """每只股票每周取一次 Yahoo 的估值与财务；每次运行最多 FUND_MAX_MIN 分钟，最久没更新的先取。"""
+        from .src_global import yahoo_symbol
+
+        stale = add_days(self.today, -FUND_REFRESH_DAYS)
+        due = [s for s in self.stocks.values() if not s.excluded and s.has_data()
+               and (force or not s.fin_date or s.fin_date <= stale)]
+        if not due:
+            return
+        budget = min(FUND_MAX_MIN * 60, self.time_left() - 5 * 60)
+        if budget < 60:
+            self.note(f"估值与财务：时间不够，{len(due)} 只留到下次")
+            return
+        due.sort(key=lambda s: (s.fin_date, s.code))
+        items = [(s.code, yahoo_symbol(self.mkt, s.code)) for s in due]
+        t0 = time.time()
+        ok, errors, flags = 0, Counter(), Counter()
+        for code, info, err in self.src.infos(items, FUND_WORKERS, time.time() + budget):
+            s = self.stocks[code]
+            if info is None:
+                if err.startswith("未请求"):
+                    continue
+                s.fin_fails += 1
+                errors[err.split("：")[0]] += 1
+                if err.startswith("没有数据"):
+                    s.fin_date = self.today  # Yahoo 没有这只股票的资料：一周后再试，不必每天重试
+                continue
+            for f in apply_info(s, info, self.today):
+                flags[f] += 1
+            s.fin_fails = 0
+            ok += 1
+        left = sum(1 for s in due if s.fin_date != self.today)
+        msg = f"估值与财务（Yahoo）：本次取到 {ok} / {len(due)} 只，用时 {(time.time() - t0) / 60:.1f} 分钟"
+        if left:
+            msg += f"；还有 {left} 只下次继续"
+        if errors:
+            msg += "；失败 " + "，".join(f"{k} {v}" for k, v in errors.most_common(4))
+        if flags:
+            msg += "；核对：" + "，".join(f"{k} {v}" for k, v in flags.most_common(5))
+        self.note(msg)
+
     # ---------- 总入口 ----------
     def run(self, mode: str = "daily") -> None:
         force = mode == "full"
@@ -307,20 +358,25 @@ class GlobalUpdater:
         self.update_issue_sources(force=force)
         cutoff = cutoff_date(self.mkt, self.now)
         done = self.meta.get("settled_date", "")  # 已经用稳定数据算过的最后一天
+        skip = False
         if mode == "daily" and self.meta.get("complete") and done:
             latest = self.src.latest_date()
             latest = min(latest, cutoff) if latest else ""
             if latest and latest <= done:
-                self.note(f"Yahoo 还没有比 {done} 更新的收盘数据，本次不重新下载")
-                self.meta["updated_at"] = bj_now().strftime("%Y-%m-%d %H:%M")
-                return
-        self.download(cutoff)
-        # 收盘后不久的运行，Yahoo 当天的数据可能还会修正：不标记为稳定，补跑时再下载一次
-        self.meta["settled_date"] = cutoff if self.meta.get("complete") and settled(self.mkt, self.now, cutoff) else ""
-        self.tencent_check()
-        dates = [s.last_trade for s in self.stocks.values() if s.has_data() and s.fetched == self.today]
-        if dates:
-            self.meta["market_date"] = max(dates)
+                self.note(f"Yahoo 还没有比 {done} 更新的收盘数据，本次不重新下载历史行情")
+                skip = True
+        if not skip:
+            self.download(cutoff)
+            # 收盘后不久的运行，Yahoo 当天的数据可能还会修正：不标记为稳定，补跑时再下载一次
+            self.meta["settled_date"] = cutoff if self.meta.get("complete") and settled(self.mkt, self.now, cutoff) else ""
+            self.tencent_check()
+            dates = [s.last_trade for s in self.stocks.values() if s.has_data() and s.fetched == self.today]
+            if dates:
+                self.meta["market_date"] = max(dates)
+        try:
+            self.refresh_fundamentals(force=force)
+        except Exception as e:  # noqa: BLE001  只影响评分，不影响比值
+            self.note(f"⚠️ 估值与财务获取失败（只影响评分，不影响比值）：{type(e).__name__}: {e}")
         self.meta["updated_at"] = bj_now().strftime("%Y-%m-%d %H:%M")
 
 
@@ -355,3 +411,8 @@ def report(up: GlobalUpdater) -> None:
     stale = [s for s in shown if s.fetched != up.today]
     if stale:
         summary(f"- 本次没有下载成功、沿用上次结果的：{len(stale)} 只")
+    with_fin = [s for s in shown if s.fin_date]
+    sc = g_scores(stocks)
+    cnt = {k: sum(1 for d in sc.values() if k in d) for k in ("value", "quality", "growth", "total")}
+    summary(f"- 评分：有估值财务数据 {len(with_fin)} 只；价值分 {cnt['value']}，质量分 {cnt['quality']}，"
+            f"成长分 {cnt['growth']}，综合分 {cnt['total']} 只；有行业信息 {sum(1 for s in with_fin if s.industry)} 只")

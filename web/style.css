@@ -122,9 +122,7 @@ td a { color: var(--accent); text-decoration: none; }
 .explain b { color: var(--text); }
 .foot { color: var(--muted); font-size: 12px; padding-bottom: 28px; }
 
-/* 港美股没有评分列，发行价、上市日期在较窄的屏幕上也能显示 */
-@media (max-width: 1400px) { body:not(.intl) .hide-l { display: none; } }
-@media (max-width: 860px) { .intl .hide-l { display: none; } }
+@media (max-width: 1400px) { .hide-l { display: none; } }
 @media (max-width: 860px) { .hide-m { display: none; } }
 @media (max-width: 760px) {
   .hide-s { display: none; }
