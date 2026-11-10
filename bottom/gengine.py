@@ -34,6 +34,7 @@ class YBar:
     low: float
     close: float  # 已按拆合股调整
     adjclose: float  # 再按分红调整
+    volume: float = math.nan  # 成交量；没有这个信息时为 nan
 
 
 @dataclass
@@ -53,8 +54,9 @@ class GStock(Record):
     issue_cmp: float = math.nan  # 发行价换算到今天口径（可以直接和历史最低比较）
     issue_note: str = ""  # 有发行价但没有采用的原因
     first_date: str = ""  # 数据里的第一根 K 线
-    last_trade: str = ""
-    last_close: float = math.nan  # 最后交易日收盘价
+    last_trade: str = ""  # 最后一次有成交的日期（停牌、没人买卖的日子 Yahoo 也有日线，但成交量是 0）
+    last_bar: str = ""  # Yahoo 最后一根日线的日期
+    last_close: float = math.nan  # 最后一根日线的收盘价
     min_low: float = math.inf  # 历史最低价（日内最低，今天口径）
     min_low_date: str = ""
     min_close: float = math.inf  # 历史最低收盘价（今天口径）
@@ -81,6 +83,9 @@ class GStock(Record):
     np_yoy: float = math.nan  # 盈利同比 %（最近一个季度）
     mcap: float = math.nan  # 取数时的总市值（交易币种）
     mcap_px: float = math.nan  # 取数时的股价（用来按最新收盘价换算市值）
+    fin_cur: str = ""  # 报表币种（和交易币种不同时，Yahoo 的市销率没有换算汇率）
+    ps_raw: float = math.nan  # Yahoo 给的市销率（原始值）
+    ps_imp: float = math.nan  # 市盈率 × 净利率 推算出的市销率（盈利的公司才有）
     fin_date: str = ""  # 最近一次取估值与财务数据的日期
     fin_fails: int = 0
 
@@ -111,6 +116,17 @@ def _days(a: str, b: str) -> int:
     return (dt.date.fromisoformat(a) - dt.date.fromisoformat(b)).days
 
 
+def _traded(b: YBar, prev: YBar | None) -> bool:
+    """这一天有没有成交。停牌或没人买卖的日子，Yahoo 的日线成交量是 0、开高低收都等于前一天的收盘价。
+
+    没有成交量信息时按有成交算；成交量是 0 但价格动了（数据缺成交量），也按有成交算。"""
+    if not (isinstance(b.volume, (int, float)) and math.isfinite(b.volume)) or b.volume > 0:
+        return True
+    if is_pos(b.high) and is_pos(b.low) and not math.isclose(b.high, b.low, rel_tol=1e-9):
+        return True
+    return prev is not None and not math.isclose(b.close, prev.close, rel_tol=1e-9)
+
+
 def compute(s: GStock, bars: list[YBar], splits: list[tuple[str, float]], divs: list[tuple[str, float]],
             cutoff: str) -> bool:
     """用完整历史重算一只股票。cutoff 之后的 K 线（盘中未收盘）不计入。没有有效数据返回 False，状态不变。
@@ -131,9 +147,11 @@ def compute(s: GStock, bars: list[YBar], splits: list[tuple[str, float]], divs: 
     if not bars:
         return False
     min_low, min_low_date, min_close, min_close_date = math.inf, "", math.inf, ""
-    n_fix, jump = 0, ""
+    n_fix, jump, traded = 0, "", ""
     prev = None
     for b in bars:
+        if _traded(b, prev):
+            traded = b.date
         f = b.adjclose / b.close
         ref = min(b.close, b.open) if is_pos(b.open) else b.close
         lo = b.low if is_pos(b.low) else ref
@@ -151,7 +169,8 @@ def compute(s: GStock, bars: list[YBar], splits: list[tuple[str, float]], divs: 
         prev = b
     last = bars[-1]
     k = last.close / last.adjclose  # 正常为 1；统一到“最后收盘价”口径
-    s.first_date, s.last_trade, s.last_close = bars[0].date, last.date, last.close
+    s.first_date, s.last_bar, s.last_close = bars[0].date, last.date, last.close
+    s.last_trade = traded or last.date
     s.patched = ""
     s.min_low, s.min_low_date = min_low * k, min_low_date
     s.min_close, s.min_close_date = min_close * k, min_close_date
@@ -359,8 +378,9 @@ def apply_info(s: GStock, info: dict, today: str) -> list[str]:
     s.fin_date = today
     price = _num(info.get("currentPrice")) if is_pos(_num(info.get("currentPrice"))) else _num(info.get("regularMarketPrice"))
     s.mcap, s.mcap_px = _num(info.get("marketCap")), price
-    for k in ("pe", "pb", "ps", "roe", "gpm", "cfroe", "rev_yoy", "np_yoy"):
+    for k in ("pe", "pb", "ps", "ps_raw", "ps_imp", "roe", "gpm", "cfroe", "rev_yoy", "np_yoy"):
         setattr(s, k, math.nan)
+    s.fin_cur = ""
     if cur and cur != MARKET_CURRENCY.get(s.mkt, cur):
         flags.append("交易币种不符")  # 比如美元柜台，价格和市值口径不一致，估值不用
         s.mcap = math.nan
@@ -376,19 +396,16 @@ def apply_info(s: GStock, info: dict, today: str) -> list[str]:
             s.pe = ype
         pb = _num(info.get("priceToBook"))
         s.pb = pb if is_pos(pb) and pb <= 1000 else math.nan  # 净资产为负（大额回购）时视为缺失，不当成最便宜
-        ps = _in(_num(info.get("priceToSalesTrailing12Months")), 1e-6, 1000)
+        s.fin_cur = fin_cur
+        s.ps_raw = _in(_num(info.get("priceToSalesTrailing12Months")), 1e-9, 1e9)
         margin = _num(info.get("profitMargins"))
         if is_pos(s.pe) and is_pos(margin):
-            implied = s.pe * margin
-            if math.isfinite(ps) and abs(ps / implied - 1) > PS_CHECK_TOL:
-                flags.append("市销率改用推算值")
-                ps = implied
-            elif not math.isfinite(ps):
-                ps = implied
-        elif fin_cur != cur and math.isfinite(ps):
-            flags.append("币种不同、市销率无法核对")
-            ps = math.nan
-        s.ps = ps
+            s.ps_imp = s.pe * margin
+        s.ps = ps_value(s)
+        if is_pos(s.ps_imp) and is_pos(s.ps_raw) and abs(s.ps_raw / s.ps_imp - 1) > PS_CHECK_TOL:
+            flags.append("币种不同、市销率用推算值" if fin_cur != cur else "市销率改用推算值")
+        elif fin_cur != cur and is_pos(s.ps_raw) and not is_pos(s.ps_imp):
+            flags.append("币种不同、亏损，市销率按汇率系数换算")
     roe = _num(info.get("returnOnEquity"))
     s.roe = _in(roe * 100, -500, 500)
     gm = _num(info.get("grossMargins"))
@@ -401,6 +418,61 @@ def apply_info(s: GStock, info: dict, today: str) -> list[str]:
     s.rev_yoy = _in(_num(info.get("revenueGrowth")) * 100, -100, 10000)
     s.np_yoy = _in(_num(info.get("earningsGrowth")) * 100, -10000, 100000)
     return flags
+
+
+def ps_value(s: GStock, fx: dict | None = None) -> float:
+    """市销率。Yahoo 的市销率 = 市值（交易币种）÷ 营收（报表币种），两个币种不同时没有换算汇率；
+    市盈率用的每股收益是换算过的，所以“市盈率 × 净利率”才是口径一致的市销率。
+
+    * 能推算（盈利）：币种不同就用推算值；币种相同以 Yahoo 的为准，两者相差超过三成时用推算值。
+    * 不能推算（亏损）：币种相同用 Yahoo 的；币种不同时除以汇率系数 fx[报表币种]（见 ps_fx），没有系数就不用。"""
+    mismatch = bool(s.fin_cur) and s.fin_cur != MARKET_CURRENCY.get(s.mkt, s.fin_cur)
+    if is_pos(s.ps_imp):
+        if mismatch or not is_pos(s.ps_raw) or abs(s.ps_raw / s.ps_imp - 1) > PS_CHECK_TOL:
+            v = s.ps_imp
+        else:
+            v = s.ps_raw
+    elif not mismatch:
+        v = s.ps_raw
+    else:
+        k = (fx or {}).get(s.fin_cur)
+        v = s.ps_raw / k[0] if k and is_pos(s.ps_raw) else math.nan
+    return _in(v, 1e-6, 1000)
+
+
+PS_FX_MIN = 8  # 一种报表币种至少有这么多只能核对的股票，才反推它的汇率系数
+PS_FX_NEAR = 0.6  # 其中至少六成的比值在中位数的 ±15% 以内，才认为这个系数可靠
+
+
+def ps_fx(stocks) -> dict[str, tuple[float, int]]:
+    """反推汇率系数：{报表币种: (系数, 样本数)}。
+
+    对报表币种和交易币种不同、又能推算市销率的股票，“Yahoo 的市销率 ÷ 推算值”就是两种货币的汇率
+    （比如港股里用人民币出报表的公司约为 1.09，用美元的约为 7.8）。取中位数，用来换算亏损公司的市销率。"""
+    by: dict[str, list[float]] = {}
+    for s in stocks:
+        if s.fin_cur and s.fin_cur != MARKET_CURRENCY.get(s.mkt, s.fin_cur) and is_pos(s.ps_raw) and is_pos(s.ps_imp):
+            by.setdefault(s.fin_cur, []).append(s.ps_raw / s.ps_imp)
+    out = {}
+    for cur, rs in by.items():
+        if len(rs) < PS_FX_MIN:
+            continue
+        k = statistics.median(rs)
+        if sum(1 for r in rs if abs(r / k - 1) <= 0.15) >= PS_FX_NEAR * len(rs):
+            out[cur] = (k, len(rs))
+    return out
+
+
+def apply_ps_fx(stocks) -> tuple[dict, int]:
+    """按反推的汇率系数，补上“币种不同、亏损”的公司的市销率。返回（系数表, 补上的只数）。"""
+    stocks = [s for s in stocks if s.fin_date and s.fin_cur]
+    fx = ps_fx(stocks)
+    n = 0
+    for s in stocks:
+        if s.fin_cur != MARKET_CURRENCY.get(s.mkt, s.fin_cur) and not is_pos(s.ps_imp):
+            s.ps = ps_value(s, fx)
+            n += is_pos(s.ps)
+    return fx, n
 
 
 def metric_value_g(s: GStock, name: str) -> float:

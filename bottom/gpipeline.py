@@ -12,8 +12,8 @@ import os
 import time
 from collections import Counter
 
-from .gengine import (GStock, apply_info, choose_ipo, common_date, compute, cutoff_date, g_scores, hist_cut, is_pos,
-                      patch_apply, patch_check, settled, shell_like, spac_like)
+from .gengine import (GStock, apply_info, apply_ps_fx, choose_ipo, common_date, compute, cutoff_date, g_scores,
+                      hist_cut, is_pos, patch_apply, patch_check, settled, shell_like, spac_like)
 from .util import add_days, bj_now, summary
 
 LIST_GUARD = 0.9  # 官方列表比上次少一成以上时，认为列表不完整，不删除股票
@@ -266,7 +266,7 @@ class GlobalUpdater:
                 continue
             s.fails, s.fetched = 0, self.today
             ok += 1
-            last_dates[s.last_trade] += 1
+            last_dates[s.last_bar] += 1
             if self.mkt == "us":
                 s.excluded = "spac" if spac_like(s.name_en, bars, cutoff) or shell_like(s) else ""
         self.stats.update(tried=len(items), ok=ok, secs=time.time() - t0)
@@ -422,6 +422,12 @@ class GlobalUpdater:
             self.refresh_fundamentals(force=force)
         except Exception as e:  # noqa: BLE001  只影响评分，不影响比值
             self.note(f"⚠️ 估值与财务获取失败（只影响评分，不影响比值）：{type(e).__name__}: {e}")
+        fx, n_fx = apply_ps_fx(self.stocks.values())
+        if fx:
+            top = sorted(fx.items(), key=lambda kv: -kv[1][1])[:4]
+            self.note("市销率：报表币种和交易币种不同时 Yahoo 没有换算汇率，按能核对的股票反推汇率系数（"
+                      + "，".join(f"{c} {k:.3g}（{n} 只）" for c, (k, n) in top)
+                      + f"），补上亏损公司的市销率 {n_fx} 只")
         self.meta["updated_at"] = bj_now().strftime("%Y-%m-%d %H:%M")
 
 
@@ -441,6 +447,11 @@ def report(up: GlobalUpdater) -> None:
             names = [s.name_en or s.code for s in stocks if s.excluded == k][:8]
             parts.append(f"{EXCLUDE_LABEL.get(k, k)} {v} 只，例如 {'、'.join(names)}")
         summary("- 不显示：" + "；".join(parts))
+    md = up.meta.get("market_date", "")
+    quiet = [s for s in shown if md and s.last_trade and s.last_trade < md]
+    if quiet:
+        long_ = sum(1 for s in quiet if (dt.date.fromisoformat(md) - dt.date.fromisoformat(s.last_trade)).days > 14)
+        summary(f"- 数据日期当天没有成交的：{len(quiet)} 只（其中两周以上没有成交的 {long_} 只，网页上标“停牌”；其余标“无成交”）")
     patched = [s for s in shown if s.patched]
     if patched:
         summary(f"- 最新一天（{max(s.patched for s in patched)}）来自腾讯行情的：{len(patched)} 只（Yahoo 的完整历史还没有这一天）")

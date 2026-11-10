@@ -450,11 +450,20 @@ def test_apply_info_basic_and_checks():
     # ADR：报表币种人民币，Yahoo 市销率没换算（小了约 7 倍）→ 用 市盈率 × 净利率 推算
     s4 = GStock(code="BABA", mkt="us")
     flags = apply_info(s4, _info(financialCurrency="CNY", priceToSalesTrailing12Months=0.28), "2026-11-09")
-    assert s4.ps == pytest.approx(2.0) and "市销率改用推算值" in flags
-    # 亏损的 ADR：市销率无法核对，不用
+    assert s4.ps == pytest.approx(2.0) and "币种不同、市销率用推算值" in flags
+    # 亏损的 ADR：没法推算，等汇率系数（见 test_ps_fx_calibration）；没有系数时不用
     s5 = GStock(code="ADR", mkt="us")
     flags = apply_info(s5, _info(financialCurrency="CNY", trailingEps=-1, trailingPE=None, profitMargins=-0.2), "2026-11-09")
-    assert math.isnan(s5.ps) and "币种不同、市销率无法核对" in flags
+    assert math.isnan(s5.ps) and s5.ps_raw == 2.0 and "币种不同、亏损，市销率按汇率系数换算" in flags
+    # 币种相同：以 Yahoo 的为准；和推算值相差超过三成才用推算值
+    s8 = GStock(code="C", mkt="us")
+    assert apply_info(s8, _info(priceToSalesTrailing12Months=2.4), "2026-11-09") == [] and s8.ps == 2.4
+    s9 = GStock(code="D", mkt="us")
+    assert "市销率改用推算值" in apply_info(s9, _info(priceToSalesTrailing12Months=3.5), "2026-11-09") and s9.ps == pytest.approx(2.0)
+    # 币种相同、亏损：直接用 Yahoo 的
+    s10 = GStock(code="E", mkt="us")
+    apply_info(s10, _info(trailingEps=-1, trailingPE=None, profitMargins=-0.2, priceToSalesTrailing12Months=5.0), "2026-11-09")
+    assert s10.ps == 5.0
     # 交易币种不对（如美元柜台）：估值不用
     s6 = GStock(code="00001", mkt="hk")
     flags = apply_info(s6, _info(), "2026-11-09")
@@ -705,3 +714,84 @@ def test_intraday_run_then_evening_run_with_yahoo_lag(tmp_path):
     assert {s.last_trade for s in up.stocks.values()} == {"2026-11-09"}
     assert all(s.patched == "2026-11-09" for s in up.stocks.values())
     assert up.meta["market_date"] == "2026-11-09" and up.meta["settled_date"] == ""
+
+
+def test_ps_fx_calibration():
+    """港股里用人民币、美元出报表的公司：Yahoo 的市销率没换算汇率。用盈利公司反推汇率系数，再换算亏损公司的。"""
+    from bottom.gengine import apply_info, apply_ps_fx
+
+    def info(fc, k, loss=False, noise=1.0):
+        true_ps = 2.0
+        base = {"currency": "HKD", "financialCurrency": fc, "currentPrice": 10.0, "trailingEps": 0.5, "trailingPE": 20.0,
+                "profitMargins": 0.1, "priceToSalesTrailing12Months": true_ps * k * noise, "priceToBook": 1.0,
+                "marketCap": 1e9}
+        if loss:
+            base.update(trailingEps=-0.5, trailingPE=None, profitMargins=-0.1)
+        return base
+
+    stocks = []
+    for i in range(12):  # 人民币报表、盈利：比值在 1.09 附近
+        s = GStock(code=f"{i:05d}", mkt="hk", last_close=10, min_low=5)
+        apply_info(s, info("CNY", 1.09, noise=1 + 0.01 * (i % 3 - 1)), "2026-11-10")
+        assert s.ps == pytest.approx(2.0)  # 盈利的直接用推算值
+        stocks.append(s)
+    for i in range(12, 22):  # 美元报表、盈利：7.8
+        s = GStock(code=f"{i:05d}", mkt="hk", last_close=10, min_low=5)
+        apply_info(s, info("USD", 7.8), "2026-11-10")
+        stocks.append(s)
+    for i in range(22, 25):  # 新加坡元报表：样本太少，不反推
+        s = GStock(code=f"{i:05d}", mkt="hk", last_close=10, min_low=5)
+        apply_info(s, info("SGD", 5.8), "2026-11-10")
+        stocks.append(s)
+    for i in range(25, 37):  # 日元报表：比值很分散（数据不一致），不用
+        s = GStock(code=f"{i:05d}", mkt="hk", last_close=10, min_low=5)
+        apply_info(s, info("JPY", 0.05, noise=1 + 0.5 * (i % 4)), "2026-11-10")
+        stocks.append(s)
+    loss = {}
+    for fc, k in (("CNY", 1.09), ("USD", 7.8), ("SGD", 5.8), ("JPY", 0.05), ("HKD", 1.0)):
+        s = GStock(code="9" + fc, mkt="hk", last_close=10, min_low=5)
+        apply_info(s, info(fc, k, loss=True), "2026-11-10")
+        loss[fc] = s
+        stocks.append(s)
+    assert math.isnan(loss["CNY"].ps) and loss["HKD"].ps == pytest.approx(2.0)  # 币种相同的不受影响
+    fx, n = apply_ps_fx(stocks)
+    assert set(fx) == {"CNY", "USD"} and fx["CNY"][0] == pytest.approx(1.09, rel=0.02) and fx["USD"] == (pytest.approx(7.8), 10)
+    assert loss["CNY"].ps == pytest.approx(2.0, rel=0.02) and loss["USD"].ps == pytest.approx(2.0)
+    assert math.isnan(loss["SGD"].ps) and math.isnan(loss["JPY"].ps) and n == 2
+    # 以前取的数据没有报表币种：保持原来的值不动
+    old = GStock(code="old", mkt="hk", last_close=10, min_low=5, fin_date="2026-11-09", ps=3.3)
+    apply_ps_fx(stocks + [old])
+    assert old.ps == 3.3
+
+
+def test_last_trade_uses_volume():
+    """停牌、没人买卖的日子 Yahoo 也有日线（成交量 0、价格不变）：最后交易日取最后一次有成交的日子。"""
+    dates = days(6)
+    bars = [YBar(dates[0], 10, 10.5, 9.8, 10.2, 10.2, 5000), YBar(dates[1], 10.2, 10.3, 10.0, 10.1, 10.1, 3000),
+            YBar(dates[2], 10.1, 10.1, 10.1, 10.1, 10.1, 0), YBar(dates[3], 10.1, 10.1, 10.1, 10.1, 10.1, 0),
+            YBar(dates[4], 10.1, 10.1, 10.1, 10.1, 10.1, 0), YBar(dates[5], 10.1, 10.1, 10.1, 10.1, 10.1, 0)]
+    s = GStock(code="00059", mkt="hk")
+    compute(s, bars, [], [], dates[-1])
+    assert (s.last_trade, s.last_bar, s.last_close) == (dates[1], dates[5], 10.1)
+    # 成交量缺失（记成 0）但价格动了：按有成交算
+    bars[5] = YBar(dates[5], 10.1, 10.4, 10.0, 10.3, 10.3, 0)
+    compute(s, bars, [], [], dates[-1])
+    assert s.last_trade == dates[5]
+    # 没有成交量信息（nan）：按有成交算，和以前一样
+    bars = [YBar(d, 10, 10, 10, 10, 10) for d in dates]
+    compute(s, bars, [], [], dates[-1])
+    assert s.last_trade == dates[5]
+
+
+def test_no_trade_stock_is_not_patched_and_date_is_stable(tmp_path):
+    """没成交的股票：不管 Yahoo 有没有当天那根成交量为 0 的日线，最后交易日都停在上一次成交的那天。"""
+    from bottom.gengine import patch_check
+
+    dates = days(5, "2026-11-04")
+    flat = [YBar(dates[0], 1.0, 1.1, 0.9, 1.0, 1.0, 100)] + [YBar(d, 1.0, 1.0, 1.0, 1.0, 1.0, 0) for d in dates[1:]]
+    a, b = GStock(code="a", mkt="hk"), GStock(code="b", mkt="hk")
+    compute(a, flat, [], [], dates[-1])       # Yahoo 已经有当天的日线
+    compute(b, flat[:-1], [], [], dates[-1])  # Yahoo 还没有当天的日线
+    assert a.last_trade == b.last_trade == dates[0]
+    q = {"date": dates[-1], "price": 1.0, "preclose": 1.0, "high": 0.0, "low": 0.0}  # 腾讯：当天没有成交
+    assert patch_check(a, q, dates[-1]) == "" and patch_check(b, q, dates[-1]) == ""

@@ -36,7 +36,7 @@
       </label>
       <label class="chk"><input type="checkbox" id="useIssue" checked> 含发行价</label>
       <label class="chk a-only"><input type="checkbox" id="noST"> 排除 ST</label>
-      <label class="chk"><input type="checkbox" id="noSusp"> 排除停牌</label>
+      <label class="chk"><input type="checkbox" id="noSusp"> <span id="noSuspLabel">排除停牌</span></label>
       <label class="chk a-only"><input type="checkbox" id="noDelist"> 排除退市整理</label>
       <label>比值 ≤ <input id="maxRatio" type="number" min="1" step="0.05" placeholder="不限" inputmode="decimal"></label>
       <label><select id="scoreKey" aria-label="分数类型">
@@ -107,7 +107,7 @@
       <li><b>※ 历史不完整</b>：Yahoo 的港股历史最早只到 2000 年，更早上市的港股只能算 2000 年以来的最低价；美股上市很早的老股票同理。</li>
       <li><b>⚠ 数据可疑</b>：历史中有单日涨跌超过 4 倍的情况，可能是拆股、合股没有复权，比值仅供参考。</li>
       <li><b>美股范围</b>：纳斯达克、纽交所等交易所上市的普通股和 ADR，不含 ETF、优先股、权证、封闭式基金，也不含并购前的 SPAC 空壳（股价一直在 10 美元附近）。</li>
-      <li><b>“停牌”标记</b>：最后交易日早于多数股票的数据日期，说明当天没有成交（停牌，或者成交很少的股票当天没人买卖）。</li>
+      <li><b>“停牌”“无成交”标记</b>：最后一次成交早于数据日期。两周以上没有成交的标“停牌”，否则标“无成交”——港股每天有几百只小盘股没人买卖，并不是停牌。鼠标停在标记上可以看到最后成交日。勾选“排除停牌、无成交”可以把它们都去掉。</li>
       <li><b>港股范围</b>：主板和创业板的股本证券，不含人民币柜台、权证、牛熊证、ETF，也不含合股期间的临时柜台和供股权。</li>
       <li><b>实时价</b>：来自腾讯行情，可能有延迟；除息日当天的比值要等收盘后的数据才完全准确。</li>
       <li><b>评分</b>：和 A 股一样分价值、质量、成长、综合四个分数（0–100，越高越好），数据来自 Yahoo，每只股票每周更新一次。先在同行业（Yahoo 的细分行业）内比较；同行业不足 8 只时与同一大类比较，再不够与全市场比较。港股、美股分开比较。</li>

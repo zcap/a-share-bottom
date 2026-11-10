@@ -163,11 +163,12 @@ def frame_to_bars(df) -> tuple[list[YBar], list[tuple[str, float]], list[tuple[s
     o, h, lo, c = col("Open"), col("High"), col("Low"), col("Close")
     a = col("Adj Close", c)
     sp, dv = col("Stock Splits", [0.0] * len(dates)), col("Dividends", [0.0] * len(dates))
+    vol = col("Volume")
     by_date: dict[str, YBar] = {}
     splits: dict[str, float] = {}
     divs: dict[str, float] = {}
     for i, d in enumerate(dates):
-        by_date[d] = YBar(d, o[i], h[i], lo[i], c[i], a[i])
+        by_date[d] = YBar(d, o[i], h[i], lo[i], c[i], a[i], vol[i])
         if math.isfinite(sp[i]) and sp[i] > 0 and sp[i] != 1:
             splits[d] = sp[i]
         if math.isfinite(dv[i]) and dv[i] > 0:
@@ -243,9 +244,11 @@ def _parallel(items: list[tuple[str, str]], fetch, workers: int, deadline: float
                     return code, None, f"没有数据：{str(e)[:80]}"
                 time.sleep(3)
             except Exception as e:  # noqa: BLE001
-                if attempt >= 2:
+                # 401：别的请求出错时 yfinance 会换一种验证方式，正在进行的请求凭证跟着失效，稍等再试就好
+                auth = "401" in str(e)
+                if attempt >= (3 if auth else 2):
                     return code, None, f"{type(e).__name__}: {str(e)[:80]}"
-                time.sleep(2 * (attempt + 1))
+                time.sleep(1 + 3 * random.random() if auth else 2 * (attempt + 1))
         return code, None, "被限流"
 
     with ThreadPoolExecutor(max_workers=workers) as ex:

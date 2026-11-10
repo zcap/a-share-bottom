@@ -95,6 +95,8 @@ function calc(r) {
   const ic = r.intl ? r.issue_cmp : r.issue_price; // 港美股的发行价要先换算到今天口径
   if (S.useIssue && ic > 0 && ic < base) { base = ic; date = '发行价'; }
   r.price = price; r.live = live; r.susp = susp;
+  // 港美股：两周以上没有成交的标“停牌”，否则标“无成交”（港股每天有几百只小盘股没人买卖）
+  r.suspLabel = !r.intl || (Date.parse(S.data.market_date) - Date.parse(r.last_trade)) / 864e5 > 14 ? '停牌' : '无成交';
   r.ratio = Math.max(1, cur / base); r.pct = (r.ratio - 1) * 100; // 当前价本身计入了最低，比值不会小于 1
   r.lowNow = base / adj; r.lowDate = date; r.ip = r.issue_price;
 }
@@ -193,7 +195,8 @@ function activeCols() {
 }
 
 function tagsHtml(r) {
-  return (r.susp ? '<span class="tag">停牌</span>' : '') + (r.warn ? `<span class="tag warn" title="${WARN_TIP}">⚠</span>` : '');
+  return (r.susp ? `<span class="tag" title="最后成交日 ${esc(r.last_trade)}">${r.suspLabel}</span>` : '') +
+    (r.warn ? `<span class="tag warn" title="${WARN_TIP}">⚠</span>` : '');
 }
 
 const CELL = {
@@ -425,6 +428,7 @@ async function switchMarket(m, first = false) {
   $('#title').textContent = `${c.label} · 距历史最低`;
   document.title = `${c.label} · 距历史最低`;
   $('#csv').href = c.csv;
+  $('#noSuspLabel').textContent = m === 'a' ? '排除停牌' : '排除停牌、无成交';
   $('#note').textContent = m === 'a'
     ? '* 历史最低价已换算成今天的价格口径（相当于等比前复权），可以直接和现价比较。† 发行价由上市首日前收盘价推断。'
     : `* 历史最低价已换算成今天的价格口径，可以直接和现价比较。价格单位：${c.cur}。※ 历史数据没有覆盖到上市日。⚠ 数据可能有拆合股未复权。`;
