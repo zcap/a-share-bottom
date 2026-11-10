@@ -19,7 +19,7 @@ import datetime as dt
 import math
 import re
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .engine import Record, is_pos
 
@@ -63,7 +63,8 @@ class GStock(Record):
     n_divs: int = 0
     n_fix: int = 0  # 修正过的异常最低价根数
     jump_date: str = ""  # 最近一次单日涨跌超过 4 倍的日期（可能是拆合股没有复权）
-    excluded: str = ""  # spac / fund：不显示
+    excluded: str = ""  # spac / fund / temp：不显示
+    patched: str = ""  # 最新一天来自腾讯行情（Yahoo 的完整历史还没有这一天）时，记下这一天的日期
     fetched: str = ""  # 最近一次成功下载的日期
     fails: int = 0  # 连续下载失败次数
     # ---- 估值与财务（Yahoo，每周刷新；比率都是无单位的，避免报表币种和交易币种不同的问题）----
@@ -115,7 +116,18 @@ def compute(s: GStock, bars: list[YBar], splits: list[tuple[str, float]], divs: 
     """用完整历史重算一只股票。cutoff 之后的 K 线（盘中未收盘）不计入。没有有效数据返回 False，状态不变。
 
     divs：Yahoo 历史里的分红 [(除息日, 每股金额)]，金额已按拆合股调整到今天口径。"""
-    bars = [b for b in bars if b.date <= cutoff and is_pos(b.close) and is_pos(b.adjclose)]
+    clean, f_prev = [], None
+    for b in bars:
+        if b.date > cutoff or not is_pos(b.close):
+            continue
+        if is_pos(b.adjclose):
+            f_prev = b.adjclose / b.close
+        elif f_prev is None:
+            continue
+        else:  # 个别 K 线没有复权价（常见于最新一天）：沿用前一天的分红调整系数
+            b = replace(b, adjclose=b.close * f_prev)
+        clean.append(b)
+    bars = clean
     if not bars:
         return False
     min_low, min_low_date, min_close, min_close_date = math.inf, "", math.inf, ""
@@ -140,6 +152,7 @@ def compute(s: GStock, bars: list[YBar], splits: list[tuple[str, float]], divs: 
     last = bars[-1]
     k = last.close / last.adjclose  # 正常为 1；统一到“最后收盘价”口径
     s.first_date, s.last_trade, s.last_close = bars[0].date, last.date, last.close
+    s.patched = ""
     s.min_low, s.min_low_date = min_low * k, min_low_date
     s.min_close, s.min_close_date = min_close * k, min_close_date
     s.n_splits = sum(1 for d, r in splits if d <= cutoff and is_pos(r) and r != 1)
@@ -172,6 +185,53 @@ def convert_issue(s: GStock, first: YBar, splits: list[tuple[str, float]], k: fl
         s.issue_note = f"发行价 {s.issue_price:g} 和上市首日收盘价 {raw_first_close:.4g} 相差过大"
         return
     s.issue_cmp = s.issue_price / cum * (first.adjclose / first.close) * k
+
+
+PATCH_TOL = 0.005  # 腾讯的昨收和已有的最后收盘价相差在 0.5% 以内，才认为两边接得上
+
+
+def patch_check(s: GStock, q: dict, cutoff: str) -> str:
+    """腾讯行情能不能用来补上 Yahoo 缺的最新一天。返回 ""（不需要或没有成交）、"ok"、"mismatch"（接不上，不补）。
+
+    Yahoo 的完整历史对港股常常晚几个小时才有当天的日线。腾讯行情给了当天的收盘、最高、最低和昨收：
+    昨收和我们已有的最后收盘价一致，说明中间没有缺日子、也没有拆股合股，可以把这一天接上去。"""
+    d = q.get("date") or ""
+    if not (s.has_data() and s.last_trade and s.last_trade < d <= cutoff):
+        return ""
+    price, pc, hi, lo = (q.get(k) for k in ("price", "preclose", "high", "low"))
+    if not (is_pos(price) and is_pos(pc) and is_pos(hi) and is_pos(lo)):
+        return ""  # 当天没有成交（停牌）
+    if abs(pc / s.last_close - 1) > PATCH_TOL or not (1 / JUMP < price / pc < JUMP):
+        return "mismatch"
+    if not (lo <= hi and lo <= price * 1.0001 and price <= hi * 1.0001):
+        return "mismatch"  # 最高、最低和现价对不上，字段可能有问题，不用
+    return "ok"
+
+
+def patch_apply(s: GStock, q: dict) -> None:
+    """把腾讯行情的这一天接到已有结果后面（先用 patch_check 确认可以接）。
+
+    当天如果正好除息，这里不做分红调整，比值会略偏低（最多相差这次分红的幅度）；Yahoo 补上这一天后重算时自动修正。"""
+    price = q["price"]
+    lo = min(q["low"], price)
+    if lo < LOW_FIX * price:
+        lo = price
+    if lo < s.min_low:
+        s.min_low, s.min_low_date = lo, q["date"]
+    if price < s.min_close:
+        s.min_close, s.min_close_date = price, q["date"]
+    if math.isfinite(s.dy):
+        s.dy = s.dy * s.last_close / price
+    s.last_close, s.last_trade, s.patched = price, q["date"], q["date"]
+
+
+def common_date(stocks) -> str:
+    """多数股票的最后交易日（并列时取较晚的）。用它作为“数据日期”，少数股票领先或落后都不影响。"""
+    cnt: dict[str, int] = {}
+    for s in stocks:
+        if s.has_data() and not s.excluded and s.last_trade:
+            cnt[s.last_trade] = cnt.get(s.last_trade, 0) + 1
+    return max(cnt, key=lambda d: (cnt[d], d)) if cnt else ""
 
 
 def choose_ipo(records: list[dict], first_date: str) -> dict | None:
@@ -215,7 +275,12 @@ def spac_like(name: str, bars: list[YBar], today: str) -> bool:
         rets = [abs(closes[i] / closes[i - 1] - 1) for i in range(1, len(closes))]
         if statistics.median(rets) <= 0.004:
             return True
-    return bool(SPAC_NAME.search(name or "")) and len(closes) >= 10 and all(8.0 <= c <= 15.0 for c in closes)
+    return bool(SPAC_NAME.search(name or "")) and all(8.0 <= c <= 15.0 for c in closes)
+
+
+def shell_like(s: GStock) -> bool:
+    """Yahoo 把并购前的 SPAC 归在“Shell Companies”行业；股价还在 10 美元附近的按 SPAC 处理。"""
+    return s.industry == "Shell Companies" and is_pos(s.last_close) and 8.0 <= s.last_close <= 15.0
 
 
 # ---------------- 交易时间 ----------------

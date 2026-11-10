@@ -12,8 +12,8 @@ import os
 import time
 from collections import Counter
 
-from .gengine import (GStock, apply_info, choose_ipo, compute, cutoff_date, g_scores, hist_cut, is_pos, settled,
-                      spac_like)
+from .gengine import (GStock, apply_info, choose_ipo, common_date, compute, cutoff_date, g_scores, hist_cut, is_pos,
+                      patch_apply, patch_check, settled, shell_like, spac_like)
 from .util import add_days, bj_now, summary
 
 LIST_GUARD = 0.9  # 官方列表比上次少一成以上时，认为列表不完整，不删除股票
@@ -22,6 +22,11 @@ EM_REFRESH_DAYS = 7  # 港股招股价资料每周刷新
 FUND_REFRESH_DAYS = 7  # 估值与财务数据每只股票每周刷新一次
 FUND_MAX_MIN = 15  # 每次运行取估值与财务最多用几分钟，没取完的下次接着取
 FUND_WORKERS = 4  # 估值与财务的并发数（比历史行情少，Yahoo 对这个接口限流更严）
+PATCH_MARKETS = ("hk",)  # Yahoo 的完整历史缺最新一天时，用腾讯行情补上的市场（港股收盘后几个小时内常见）
+PATCH_MIN_AGREE = 0.9  # 腾讯的昨收和已有的最后收盘价接得上的比例低于它，说明不止差一天或数据有问题，全部不补
+PATCH_SETTLE_MAX = 0.05  # 靠腾讯补价的股票超过这个比例，就不算“数据已稳定”，下次运行重新下载
+NO_DOWNLOAD = ("fund", "temp")  # 这些不下载、不显示
+EXCLUDE_LABEL = {"spac": "SPAC（并购前空壳）", "fund": "封闭式基金", "temp": "临时柜台、供股权"}
 IPO_BACKFILL_FROM = "2000-01"  # 美股 IPO 日历最早回溯到这个月（纳斯达克大约从 2000 年前后开始有数据）
 IPO_BACKFILL_MIN = 12  # 每次运行回溯 IPO 日历最多用几分钟（第一次运行约需 15 分钟，会分两次完成）
 BENCH = {"hk": ["0700.HK", "0005.HK"], "us": ["AAPL", "MSFT"]}
@@ -121,9 +126,10 @@ class GlobalUpdater:
             s.name_en, s.board = info.get("name_en", ""), info.get("board", "")
             if not s.name:
                 s.name = s.name_en
-            if info.get("fund"):
-                s.excluded = "fund"
-            elif s.excluded == "fund":
+            kind = "fund" if info.get("fund") else "temp" if info.get("temp") else ""
+            if kind:
+                s.excluded = kind
+            elif s.excluded in NO_DOWNLOAD:
                 s.excluded = ""
         removed = sorted(old - set(lst)) if allow_remove else []
         for code in removed:
@@ -237,10 +243,11 @@ class GlobalUpdater:
         from .src_global import yahoo_symbol
 
         # 最久没更新的排在前面：万一被限流或时间不够，下次运行会先补它们
-        todo = sorted((s for s in self.stocks.values() if s.excluded != "fund"), key=lambda s: (s.fetched, s.code))
+        todo = sorted((s for s in self.stocks.values() if s.excluded not in NO_DOWNLOAD),
+                      key=lambda s: (s.fetched, s.code))
         items = [(s.code, yahoo_symbol(self.mkt, s.code)) for s in todo]
         t0 = time.time()
-        ok, errors = 0, Counter()
+        ok, errors, last_dates = 0, Counter(), Counter()
         failed = []
         for code, res, err in self.src.histories(items, self.workers, self.deadline):
             s = self.stocks[code]
@@ -259,14 +266,19 @@ class GlobalUpdater:
                 continue
             s.fails, s.fetched = 0, self.today
             ok += 1
+            last_dates[s.last_trade] += 1
             if self.mkt == "us":
-                s.excluded = "spac" if spac_like(s.name_en, bars, cutoff) else ""
+                s.excluded = "spac" if spac_like(s.name_en, bars, cutoff) or shell_like(s) else ""
         self.stats.update(tried=len(items), ok=ok, secs=time.time() - t0)
         self.meta["complete"] = ok >= COMPLETE_RATIO * max(1, len(items))
         msg = f"下载完整历史：成功 {ok} / {len(items)} 只，用时 {(time.time() - t0) / 60:.1f} 分钟"
         if errors:
             msg += "；失败原因 " + "，".join(f"{k} {v}" for k, v in errors.most_common(5))
             msg += "；失败示例 " + "、".join(sorted(failed)[:10])
+        if last_dates:  # Yahoo 给到哪一天：正常情况下绝大多数股票都在最新的交易日
+            top = sorted(last_dates.items(), key=lambda kv: kv[0], reverse=True)[:2]
+            rest = ok - sum(v for _, v in top)
+            msg += "；Yahoo 最后一根日线：" + "，".join(f"{d} {v} 只" for d, v in top) + (f"，更早 {rest} 只" if rest else "")
         self.note(msg)
 
     def _match_ipo(self, s: GStock, bars, cutoff: str) -> None:
@@ -278,29 +290,37 @@ class GlobalUpdater:
         elif s.issue_src == "nasdaq":
             s.issue_price, s.issue_src, s.issue_date = float("nan"), "", ""
 
-    # ---------- 腾讯行情：中文名 + 收盘价核对 ----------
-    def tencent_check(self) -> None:
+    # ---------- 腾讯行情：中文名、收盘价核对、补上 Yahoo 缺的最新一天 ----------
+    def tencent_sync(self, cutoff: str) -> int:
+        """返回用腾讯行情补了最新一天的股票数。"""
         from .src_global import tencent_symbol
 
-        live = [s for s in self.stocks.values() if s.excluded != "fund"]
+        live = [s for s in self.stocks.values() if s.excluded not in NO_DOWNLOAD]
         syms = {tencent_symbol(self.mkt, s.code): s for s in live}
         try:
             quotes = self.src.quotes(list(syms))
         except Exception as e:  # noqa: BLE001
-            self.note(f"⚠️ 腾讯行情获取失败（只影响中文名）：{type(e).__name__}: {e}")
-            return
-        same = agree = named = 0
+            self.note(f"⚠️ 腾讯行情获取失败（影响中文名和最新一天的补价）：{type(e).__name__}: {e}")
+            return 0
+        same = agree = named = mismatch = 0
+        cand = []
         for sym, q in quotes.items():
             s = syms.get(sym)
             if s is None:
                 continue
             name = q.get("name", "")
-            if name and any("一" <= ch <= "鿿" for ch in name):
+            if name and any("\u4e00" <= ch <= "\u9fff" for ch in name):
                 s.name = name
                 named += 1
             if q.get("date") == s.last_trade and is_pos(q.get("price")) and is_pos(s.last_close):
                 same += 1
                 agree += abs(q["price"] / s.last_close - 1) < 0.005
+            elif self.mkt in PATCH_MARKETS:
+                st = patch_check(s, q, cutoff)
+                if st == "ok":
+                    cand.append((s, q))
+                elif st == "mismatch":
+                    mismatch += 1
         self.stats["tencent"] = (len(quotes), same, agree)
         msg = f"腾讯行情：返回 {len(quotes)} / {len(syms)} 只，中文名 {named} 只"
         if same:
@@ -308,6 +328,22 @@ class GlobalUpdater:
             if same >= 50 and agree < 0.9 * same:
                 msg = "⚠️ " + msg + "，一致比例偏低，请检查数据"
         self.note(msg)
+        patched = 0
+        total = len(cand) + mismatch
+        if total:
+            head = f"Yahoo 的完整历史还没有最新一天的有 {total} 只（腾讯行情当天有成交）"
+            if total >= 50 and len(cand) < PATCH_MIN_AGREE * total:
+                self.note(f"⚠️ {head}，但腾讯的昨收和已有的最后收盘价只有 {len(cand)} 只接得上，可能不止差一天：这次不补，等 Yahoo 更新")
+            else:
+                dates = Counter()
+                for s, q in cand:
+                    patch_apply(s, q)
+                    dates[q["date"]] += 1
+                patched = len(cand)
+                self.note(f"{head}：用腾讯行情的收盘价、最低价补上 {patched} 只（"
+                          + "，".join(f"{d} {v} 只" for d, v in sorted(dates.items(), reverse=True)[:2])
+                          + f"；昨收和已有收盘价接不上、没有补的 {mismatch} 只）。Yahoo 有了这一天后会自动重算")
+        return patched
 
     # ---------- 估值与财务 ----------
     def refresh_fundamentals(self, force: bool = False) -> None:
@@ -315,7 +351,8 @@ class GlobalUpdater:
         from .src_global import yahoo_symbol
 
         stale = add_days(self.today, -FUND_REFRESH_DAYS)
-        due = [s for s in self.stocks.values() if not s.excluded and s.has_data()
+        # SPAC 也要取：Yahoo 把行业改成正式业务后，才能知道它已经完成并购
+        due = [s for s in self.stocks.values() if s.excluded in ("", "spac") and s.has_data()
                and (force or not s.fin_date or s.fin_date <= stale)]
         if not due:
             return
@@ -358,21 +395,29 @@ class GlobalUpdater:
         self.update_issue_sources(force=force)
         cutoff = cutoff_date(self.mkt, self.now)
         done = self.meta.get("settled_date", "")  # 已经用稳定数据算过的最后一天
-        skip = False
-        if mode == "daily" and self.meta.get("complete") and done:
-            latest = self.src.latest_date()
-            latest = min(latest, cutoff) if latest else ""
-            if latest and latest <= done:
-                self.note(f"Yahoo 还没有比 {done} 更新的收盘数据，本次不重新下载历史行情")
-                skip = True
-        if not skip:
+        try:
+            latest = self.src.latest_date()  # 几只大盘股在 Yahoo 上的最新日线日期
+        except Exception:  # noqa: BLE001
+            latest = ""
+        latest = min(latest, cutoff) if latest else ""
+        skip = bool(mode == "daily" and self.meta.get("complete") and done and latest and latest <= done)
+        if skip:
+            self.note(f"Yahoo 还没有比 {done} 更新的收盘数据，本次不重新下载历史行情")
+        else:
             self.download(cutoff)
-            # 收盘后不久的运行，Yahoo 当天的数据可能还会修正：不标记为稳定，补跑时再下载一次
-            self.meta["settled_date"] = cutoff if self.meta.get("complete") and settled(self.mkt, self.now, cutoff) else ""
-            self.tencent_check()
-            dates = [s.last_trade for s in self.stocks.values() if s.has_data() and s.fetched == self.today]
-            if dates:
-                self.meta["market_date"] = max(dates)
+        patched = self.tencent_sync(cutoff)
+        mdate = common_date(self.stocks.values())  # 多数股票的最后交易日
+        if mdate:
+            self.meta["market_date"] = mdate
+        if not skip:
+            shown = sum(1 for s in self.stocks.values() if s.has_data() and not s.excluded)
+            behind = bool(latest and mdate and mdate < latest)
+            fresh = patched <= PATCH_SETTLE_MAX * max(1, shown) and not behind
+            ready = bool(self.meta.get("complete")) and settled(self.mkt, self.now, cutoff)
+            # 收盘后不久的运行，Yahoo 当天的数据可能还会修正或还没到齐：不标记为稳定，下次运行再下载一次
+            self.meta["settled_date"] = cutoff if ready and fresh else ""
+            if behind:
+                self.note(f"⚠️ Yahoo 大盘股已经有 {latest} 的日线，但多数股票只到 {mdate}：数据日期暂时按 {mdate}，下次运行重新下载")
         try:
             self.refresh_fundamentals(force=force)
         except Exception as e:  # noqa: BLE001  只影响评分，不影响比值
@@ -391,9 +436,14 @@ def report(up: GlobalUpdater) -> None:
     ex = Counter(s.excluded for s in stocks if s.excluded)
     summary(f"- 官方列表 {len(stocks)} 只；网页显示 {len(shown)} 只；数据日期 {up.meta.get('market_date', '')}")
     if ex:
-        ex_names = {k: [s.name_en or s.code for s in stocks if s.excluded == k][:8] for k in ex}
-        summary(f"- 不显示：SPAC（并购前空壳）{ex.get('spac', 0)} 只，例如 {('、'.join(ex_names.get('spac', [])) or '无')}；"
-                f"封闭式基金 {ex.get('fund', 0)} 只，例如 {('、'.join(ex_names.get('fund', [])) or '无')}")
+        parts = []
+        for k, v in ex.most_common():
+            names = [s.name_en or s.code for s in stocks if s.excluded == k][:8]
+            parts.append(f"{EXCLUDE_LABEL.get(k, k)} {v} 只，例如 {'、'.join(names)}")
+        summary("- 不显示：" + "；".join(parts))
+    patched = [s for s in shown if s.patched]
+    if patched:
+        summary(f"- 最新一天（{max(s.patched for s in patched)}）来自腾讯行情的：{len(patched)} 只（Yahoo 的完整历史还没有这一天）")
     has_ip = [s for s in shown if is_pos(s.issue_price)]
     used = [s for s in has_ip if is_pos(s.issue_cmp)]
     notes = Counter((s.issue_note.split(" ")[0] if s.issue_note else "") for s in has_ip if not is_pos(s.issue_cmp))

@@ -26,12 +26,15 @@ const S = {
   sortKey: 'ratio', sortDir: 1,
   board: '', q: '', basis: 'low', useIssue: true, noST: false, noSusp: false, noDelist: false, maxRatio: null, minScore: null, scoreKey: 'tscore', minCap: 0,
   rt: {}, rtTime: '', rtBusy: false, rtStale: false, rtTimer: null,
+  narrow: false, // 窄屏（手机）：代码并到名称下面，列的顺序把最常看的放前面
 };
 const intl = () => S.m !== 'a';
 
 // ---------- 工具 ----------
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const fmtP = (x) => (x > 0 && isFinite(x) ? x.toFixed(x >= 1 ? 2 : x >= 0.1 ? 3 : 4) : '—');
+// 现价：港股有 0.005 的价位（如 1.325），需要时显示 3 位小数
+const fmtPx = (x) => (x >= 1 && isFinite(x) && Math.abs(x * 100 - Math.round(x * 100)) > 1e-6 ? x.toFixed(3) : fmtP(x));
 const isNum = (x) => typeof x === 'number' && isFinite(x);
 const fmtPE = (x) => (!isNum(x) ? '<span class="dim">—</span>' : x < 0 ? '<span class="dim">亏损</span>' : x.toFixed(1));
 const fmtPB = (x) => (!isNum(x) ? '<span class="dim">—</span>' : x < 0 ? '<span class="dim">资不抵债</span>' : x.toFixed(2));
@@ -41,9 +44,9 @@ function fmtCap(x) { // 总市值：亿 / 万亿
   if (x >= 1e8) return (x / 1e8).toFixed(x >= 1e10 ? 0 : 1) + '亿';
   return (x / 1e4).toFixed(0) + '万';
 }
-function scoreCell(r, k, tip, cls) {
+function scoreCell(r, k, tip) {
   const v = r[k];
-  return `<td class="num score${isNum(v) && v >= 80 ? ' good' : ''}${cls}" title="${esc(tip)}">${isNum(v) ? Math.round(v) : '<span class="dim">—</span>'}</td>`;
+  return `<td class="num score${isNum(v) && v >= 80 ? ' good' : ''}" title="${esc(tip)}">${isNum(v) ? Math.round(v) : '<span class="dim">—</span>'}</td>`;
 }
 const DESC_FIRST = new Set(['tscore', 'vscore', 'qscore', 'gscore']); // 第一次点击就从高到低排
 function localNow(tz) {
@@ -158,32 +161,84 @@ function issueCell(r) {
   return `<span class="dim" title="没有计入：发行价和历史数据对不上（详见 CSV）">${fmtP(r.ip)}</span>`;
 }
 
-function renderTable() {
-  const rows = S.view.slice(0, S.shown);
-  const link = MK[S.m].link;
-  const html = rows.map((r) => {
+// ---------- 表格的列 ----------
+// only：只在 A 股（a）或港美股（intl）显示。
+const COLS = [
+  { k: 'code', label: '代码' },
+  { k: 'name', label: '名称' },
+  { k: 'board', label: '板块' },
+  { k: 'price', label: '现价', num: 1 },
+  { k: 'lowNow', label: '历史最低<span class="hint">*</span>', num: 1 },
+  { k: 'lowDate', label: '最低日期' },
+  { k: 'ratio', label: '比值', num: 1 },
+  { k: 'pct', label: '距最低', num: 1 },
+  { k: 'tscore', label: '综合', num: 1, tip: '价值 50% + 质量 30% + 成长 20%，0–100' },
+  { k: 'vscore', label: '价值', num: 1, tip: '同行业内比较，越高越便宜' },
+  { k: 'qscore', label: '质量', num: 1, tip: '同行业内比较：净资产收益率、毛利率、经营现金流/净资产' },
+  { k: 'gscore', label: '成长', num: 1, tip: '同行业内比较：营收同比、盈利同比' },
+  { k: 'peSort', label: '市盈率', num: 1 },
+  { k: 'pbSort', label: '市净率', num: 1 },
+  { k: 'mcap', label: '市值', num: 1, only: 'intl', tip: '按最新收盘价换算，单位为当地货币' },
+  { k: 'ip', label: '发行价', num: 1 },
+  { k: 'list_date', label: '上市日期' },
+];
+// 手机上的顺序：名称（冻结，代码在名称下面）后面先放最常看的现价、比值、分数，其余往右滑
+const NARROW_ORDER = ['name', 'price', 'ratio', 'tscore', 'vscore', 'qscore', 'gscore', 'pct', 'lowNow', 'lowDate',
+  'peSort', 'pbSort', 'mcap', 'board', 'ip', 'list_date'];
+
+function activeCols() {
+  const ok = (c) => !c.only || (c.only === 'intl') === intl();
+  if (!S.narrow) return COLS.filter(ok);
+  return NARROW_ORDER.map((k) => COLS.find((c) => c.k === k)).filter(ok);
+}
+
+function tagsHtml(r) {
+  return (r.susp ? '<span class="tag">停牌</span>' : '') + (r.warn ? `<span class="tag warn" title="${WARN_TIP}">⚠</span>` : '');
+}
+
+const CELL = {
+  code: (r) => `<td class="c-code stick1"><a href="${MK[S.m].link(r)}" target="_blank" rel="noopener">${esc(r.code)}</a></td>`,
+  name: (r) => {
+    const tip = esc(r.name + (r.industry ? '\n' + r.industry : ''));
+    if (!S.narrow) return `<td class="c-name stick2 edge" title="${tip}"><span class="nm">${esc(r.name)}</span>${tagsHtml(r)}</td>`;
+    return `<td class="c-name stick1 edge" title="${tip}"><span class="nm">${esc(r.name)}</span>` +
+      `<span class="sub"><a href="${MK[S.m].link(r)}" target="_blank" rel="noopener">${esc(r.code)}</a>${tagsHtml(r)}</span></td>`;
+  },
+  board: (r) => `<td class="dim">${esc(r.board)}</td>`,
+  price: (r) => `<td class="num${r.live ? ' live' : ''}">${fmtPx(r.price)}</td>`,
+  lowNow: (r) => `<td class="num">${fmtP(r.lowNow)}</td>`,
+  lowDate: (r) => `<td class="dim">${esc(r.lowDate)}${r.hist_cut ? `<span class="hint" title="${CUT_TIP[S.m] || ''}"> ※</span>` : ''}</td>`,
+  ratio: (r) => `<td class="num ratio${r.ratio <= 1.1 ? ' hot' : ''}">${r.ratio.toFixed(3)}</td>`,
+  pct: (r) => {
     const w = Math.max(2, Math.min(60, (60 * Math.log(r.ratio)) / Math.log(5)));
-    return `<tr>
-<td><a href="${link(r)}" target="_blank" rel="noopener">${esc(r.code)}</a></td>
-<td title="${esc(r.industry || '')}">${esc(r.name)}${r.susp ? '<span class="tag">停牌</span>' : ''}${r.warn ? `<span class="tag warn" title="${WARN_TIP}">⚠</span>` : ''}</td>
-<td class="hide-m dim">${esc(r.board)}</td>
-<td class="num${r.live ? ' live' : ''}">${fmtP(r.price)}</td>
-<td class="num hide-s">${fmtP(r.lowNow)}</td>
-<td class="hide-s dim">${esc(r.lowDate)}${r.hist_cut ? `<span class="hint" title="${CUT_TIP[S.m] || ''}"> ※</span>` : ''}</td>
-<td class="num ratio${r.ratio <= 1.1 ? ' hot' : ''}">${r.ratio.toFixed(3)}</td>
-<td class="num hide-s"><span class="pct"><span class="track"><i style="width:${w.toFixed(0)}px"></i></span><em>${r.pct.toFixed(1)}%</em></span></td>
-${scoreCell(r, 'tscore', r.totTip, '')}
-${scoreCell(r, 'vscore', r.valTip, ' hide-s')}
-${scoreCell(r, 'qscore', r.qualTip, ' hide-s')}
-${scoreCell(r, 'gscore', r.growTip, ' hide-s')}
-<td class="num hide-m">${fmtPE(r.pe)}</td>
-<td class="num hide-m">${fmtPB(r.pb)}</td>
-<td class="num hide-m intl-only">${fmtCap(r.mcap)}</td>
-<td class="num hide-l">${issueCell(r)}</td>
-<td class="hide-l dim">${r.list_date || '—'}</td>
-</tr>`;
+    return `<td class="num"><span class="pct"><span class="track"><i style="width:${w.toFixed(0)}px"></i></span><em>${r.pct.toFixed(1)}%</em></span></td>`;
+  },
+  tscore: (r) => scoreCell(r, 'tscore', r.totTip),
+  vscore: (r) => scoreCell(r, 'vscore', r.valTip),
+  qscore: (r) => scoreCell(r, 'qscore', r.qualTip),
+  gscore: (r) => scoreCell(r, 'gscore', r.growTip),
+  peSort: (r) => `<td class="num">${fmtPE(r.pe)}</td>`,
+  pbSort: (r) => `<td class="num">${fmtPB(r.pb)}</td>`,
+  mcap: (r) => `<td class="num">${fmtCap(r.mcap)}</td>`,
+  ip: (r) => `<td class="num">${issueCell(r)}</td>`,
+  list_date: (r) => `<td class="dim">${r.list_date || '—'}</td>`,
+};
+
+function renderHead() {
+  const stick = S.narrow ? { name: 'stick1 edge' } : { code: 'stick1', name: 'stick2 edge' };
+  $('#hd').innerHTML = activeCols().map((c) => {
+    const cls = [c.num ? 'num' : '', c.k === 'code' ? 'c-code' : '', c.k === 'name' ? 'c-name' : '', stick[c.k] || ''].filter(Boolean).join(' ');
+    const label = S.narrow && c.k === 'name' ? '名称 / 代码' : c.label;
+    return `<th data-k="${c.k}"${cls ? ` class="${cls}"` : ''}${c.tip ? ` title="${c.tip}"` : ''}>${label}</th>`;
   }).join('');
-  $('#tb').innerHTML = html || `<tr><td colspan="17" class="dim">${S.rows.length ? '没有符合条件的股票' : '暂无数据'}</td></tr>`;
+}
+
+function renderTable() {
+  const cols = activeCols();
+  if ($('#hd').children.length !== cols.length || ($('#hd').firstElementChild || {}).dataset?.k !== cols[0].k) renderHead();
+  const rows = S.view.slice(0, S.shown);
+  const html = rows.map((r) => '<tr>' + cols.map((c) => CELL[c.k](r)).join('') + '</tr>').join('');
+  $('#tb').innerHTML = html || `<tr><td colspan="${cols.length}" class="dim">${S.rows.length ? '没有符合条件的股票' : '暂无数据'}</td></tr>`;
   const btn = $('#moreBtn');
   btn.hidden = S.view.length <= S.shown;
   btn.textContent = `显示更多（还有 ${S.view.length - S.shown} 只）`;
@@ -377,6 +432,7 @@ async function switchMarket(m, first = false) {
   S.rt = {}; S.rtStale = false; $('#rtStatus').textContent = '';
   S.sortKey = 'ratio'; S.sortDir = 1;
   renderBoards();
+  renderHead();
   $('#banner').hidden = true;
   $('#status').textContent = '加载中…';
   S.data = null; S.rows = [];
@@ -387,7 +443,8 @@ async function switchMarket(m, first = false) {
     if (S.m !== m) return;
     $('#status').textContent = `${c.label}数据还没有生成（第一次运行完成后出现），请稍后刷新。`;
     $('#buckets').innerHTML = '';
-    $('#tb').innerHTML = '<tr><td colspan="17" class="dim">暂无数据</td></tr>';
+    renderHead();
+    $('#tb').innerHTML = `<tr><td colspan="${activeCols().length}" class="dim">暂无数据</td></tr>`;
     return;
   }
   if (S.m !== m) return;
@@ -406,6 +463,10 @@ async function switchMarket(m, first = false) {
 }
 
 function bind() {
+  const mq = window.matchMedia('(max-width: 760px)');
+  S.narrow = mq.matches;
+  const onMq = (e) => { S.narrow = e.matches; renderHead(); if (S.data) renderTable(); };
+  if (mq.addEventListener) mq.addEventListener('change', onMq); else mq.addListener(onMq);
   S.basis = recall('basis', 'low');
   S.useIssue = recall('useIssue', true);
   S.noST = recall('noST', false);
@@ -466,6 +527,10 @@ function bind() {
   $('#rtBtn').addEventListener('click', fetchRealtime);
   $('#rtAuto').addEventListener('change', (e) => { store('rtAuto', e.target.checked); setAuto(e.target.checked); });
   $('#moreBtn').addEventListener('click', () => { S.shown += PAGE * 2; renderTable(); });
+  $('#tb').addEventListener('click', (e) => { // 点名称：展开 / 收起被截断的全名
+    const td = e.target.closest('td.c-name');
+    if (td && !e.target.closest('a')) td.classList.toggle('full');
+  });
   document.querySelector('thead').addEventListener('click', (e) => {
     const th = e.target.closest('th[data-k]');
     if (!th) return;

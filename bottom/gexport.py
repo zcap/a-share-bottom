@@ -75,6 +75,7 @@ def export_market(mkt: str, stocks: dict[str, GStock], meta: dict, site_dir: str
             "综合分(价值50%+质量30%+成长20%)", "价值分(同行业内,越高越便宜)", "质量分", "成长分", "行业大类", "行业",
             f"总市值({cur})", "市盈率TTM", "市净率", "市销率TTM", "股息率%", "估值财务日期",
             "净资产收益率%", "毛利率%", "经营现金流/净资产%", "营收同比%(最近季度)", "盈利同比%(最近季度)",
+            "最新一天来自腾讯行情(Yahoo还没有这一天)",
         ])
         for s in ready:
             base_l, date_l, base_c = s.min_low, s.min_low_date, s.min_close
@@ -84,7 +85,7 @@ def export_market(mkt: str, stocks: dict[str, GStock], meta: dict, site_dir: str
                 base_c = min(base_c, s.issue_cmp)
             rl, rc = max(1.0, s.last_close / base_l), max(1.0, s.last_close / base_c)
             w.writerow([
-                s.code, s.name, s.name_en, s.board, s.last_close, s.last_trade,
+                s.code, s.name, s.name_en, s.board, _r(s.last_close, 6), s.last_trade,
                 round(base_l, 4), date_l, round(rl, 4), round((rl - 1) * 100, 2),
                 round(s.min_close, 4), s.min_close_date, round(rc, 4),
                 s.issue_price if is_pos(s.issue_price) else "", round(s.issue_cmp, 4) if is_pos(s.issue_cmp) else "",
@@ -94,5 +95,6 @@ def export_market(mkt: str, stocks: dict[str, GStock], meta: dict, site_dir: str
                 SECTOR_CN.get(s.sector, s.sector), s.industry,
                 *(_fmt(v) for v in (s.mcap_now(), s.pe, s.pb, s.ps, s.dy)), s.fin_date,
                 *(_fmt(v) for v in (s.roe, s.gpm, s.cfroe, s.rev_yoy, s.np_yoy)),
+                s.patched,
             ])
     return {"rows": len(rows), "market_date": market_date}

@@ -108,6 +108,8 @@ def us_list() -> dict[str, dict]:
 
 
 HKEX_LIST = "https://www.hkex.com.hk/eng/services/trading/securities/securitieslists/ListOfSecurities.xlsx"
+# 合股、换股票期间的临时柜台（名称以 -OLD 结尾，和原代码是同一只股票）、供股权（名称以 RTS 结尾，只交易几天）
+HK_TEMP = re.compile(r"(-OLD|[ -]RTS)$", re.I)
 
 
 def parse_hkex_frame(raw) -> dict[str, dict]:
@@ -128,8 +130,9 @@ def parse_hkex_frame(raw) -> dict[str, dict]:
             continue
         if code.startswith("8"):
             continue
-        out[code] = {"name_en": str(r.get("Name of Securities", "")).strip(),
-                     "board": "创业板" if "GEM" in sub else "主板", "fund": False}
+        name = str(r.get("Name of Securities", "")).strip()
+        out[code] = {"name_en": name, "board": "创业板" if "GEM" in sub else "主板", "fund": False,
+                     "temp": bool(HK_TEMP.search(name))}
     return out
 
 
@@ -342,7 +345,8 @@ def parse_tencent(text: str) -> dict[str, dict]:
         if len(f) < 35:
             continue
         ts = re.sub(r"\D", "", f[30])
-        out[key] = {"name": f[1].strip(), "price": _f(f[3]), "preclose": _f(f[4]),
+        out[key] = {"name": f[1].strip(), "price": _f(f[3]), "preclose": _f(f[4]), "open": _f(f[5]),
+                    "high": _f(f[33]), "low": _f(f[34]),
                     "date": norm_date(ts[:8]) if len(ts) >= 8 else ""}
     return out
 

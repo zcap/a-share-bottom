@@ -68,29 +68,12 @@
   <div class="tablewrap">
     <table id="tbl">
       <thead>
-        <tr>
-          <th data-k="code">代码</th>
-          <th data-k="name">名称</th>
-          <th data-k="board" class="hide-m">板块</th>
-          <th data-k="price" class="num">现价</th>
-          <th data-k="lowNow" class="num hide-s">历史最低<span class="hint">*</span></th>
-          <th data-k="lowDate" class="hide-s">最低日期</th>
-          <th data-k="ratio" class="num sorted asc">比值</th>
-          <th data-k="pct" class="num hide-s">距最低</th>
-          <th data-k="tscore" class="num" title="价值 50% + 质量 30% + 成长 20%，0–100">综合</th>
-          <th data-k="vscore" class="num hide-s" title="同行业内比较，越高越便宜">价值</th>
-          <th data-k="qscore" class="num hide-s" title="同行业内比较：净资产收益率、毛利率、经营现金流/净资产">质量</th>
-          <th data-k="gscore" class="num hide-s" title="同行业内比较：营收同比、净利润同比">成长</th>
-          <th data-k="peSort" class="num hide-m">市盈率</th>
-          <th data-k="pbSort" class="num hide-m">市净率</th>
-          <th data-k="mcap" class="num hide-m intl-only" title="按最新收盘价换算，单位为当地货币">市值</th>
-          <th data-k="ip" class="num hide-l">发行价</th>
-          <th data-k="list_date" class="hide-l">上市日期</th>
-        </tr>
+        <tr id="hd"></tr>
       </thead>
       <tbody id="tb"></tbody>
     </table>
   </div>
+  <p class="swipe">← 左右滑动表格可以看到全部列 →</p>
   <p class="more"><button id="moreBtn" hidden>显示更多</button></p>
   <p class="note" id="note"></p>
 
@@ -100,6 +83,7 @@
       <li><b>比值</b> = 当前复权价 ÷ 上市以来最低复权价。1.00 表示正处在历史最低，1.50 表示比历史最低高 50%。</li>
       <li><b>最低价口径</b>：“日内最低价”取每天的最低成交价；“收盘价”取每天的收盘价。</li>
       <li><b>历史最低价</b>一栏已换算成今天的价格口径（相当于等比前复权），可以直接和现价比较。</li>
+      <li><b>表格</b>：放不下时可以左右滑动，代码和名称固定在左边；名称太长会截断，点一下名称显示全名；点表头排序。</li>
     </ul>
     <ul class="a-only">
       <li><b>复权</b>：等比后复权（BaoStock 复权因子）。上市首日因子为 1，每次分红、送转、配股后按“前一日收盘价 ÷ 除权除息参考价”累乘。等比复权下，这个比值与用前复权价算出的完全一致，且不会出现负价。</li>
@@ -117,12 +101,14 @@
     </ul>
     <ul class="intl-only">
       <li><b>数据</b>：每个交易日收盘后，从 Yahoo Finance 重新下载每只股票的完整历史，从头计算（不做增量），新的分红、拆股、合股都会自动反映。价格单位是当地货币（港元 / 美元）。</li>
+      <li><b>港股最新一天</b>：Yahoo 的完整历史对港股常常要晚几个小时才有当天的日线。这段时间里，当天的收盘价、最低价先用腾讯行情补上（腾讯的昨收必须和已有的最后收盘价对得上才补），Yahoo 有了这一天后自动重算。补上的这一天如果正好除息，比值会略偏低，重算后修正。</li>
       <li><b>复权</b>：等比复权，包含分红、拆股、合股。Yahoo 对港股的<b>供股</b>一般不做复权，经常供股的股票比值可能有偏差。</li>
       <li><b>含发行价</b>：港股用东方财富港股资料的招股价，美股用纳斯达克 IPO 日历的发行价（约 2000 年以后上市的）；换算到今天口径后参与取最小。发行价必须和数据第一天、上市首日收盘价对得上才采用。介绍上市、直接上市、SPAC 合并上市等没有发行价。</li>
       <li><b>※ 历史不完整</b>：Yahoo 的港股历史最早只到 2000 年，更早上市的港股只能算 2000 年以来的最低价；美股上市很早的老股票同理。</li>
       <li><b>⚠ 数据可疑</b>：历史中有单日涨跌超过 4 倍的情况，可能是拆股、合股没有复权，比值仅供参考。</li>
       <li><b>美股范围</b>：纳斯达克、纽交所等交易所上市的普通股和 ADR，不含 ETF、优先股、权证、封闭式基金，也不含并购前的 SPAC 空壳（股价一直在 10 美元附近）。</li>
-      <li><b>港股范围</b>：主板和创业板的股本证券，不含人民币柜台、权证、牛熊证、ETF 等。</li>
+      <li><b>“停牌”标记</b>：最后交易日早于多数股票的数据日期，说明当天没有成交（停牌，或者成交很少的股票当天没人买卖）。</li>
+      <li><b>港股范围</b>：主板和创业板的股本证券，不含人民币柜台、权证、牛熊证、ETF，也不含合股期间的临时柜台和供股权。</li>
       <li><b>实时价</b>：来自腾讯行情，可能有延迟；除息日当天的比值要等收盘后的数据才完全准确。</li>
       <li><b>评分</b>：和 A 股一样分价值、质量、成长、综合四个分数（0–100，越高越好），数据来自 Yahoo，每只股票每周更新一次。先在同行业（Yahoo 的细分行业）内比较；同行业不足 8 只时与同一大类比较，再不够与全市场比较。港股、美股分开比较。</li>
       <li><b>价值分</b>：市盈率（TTM）、市净率、市销率（TTM）取倒数，再加上<b>股息率</b>（最近 12 个月分红 ÷ 现价），四项至少有两项才给分。亏损的市盈率排最差；<b>净资产为负</b>（美股常见于大额回购，如麦当劳）时市净率按缺失处理，不当成最便宜。</li>

@@ -192,8 +192,17 @@ def test_parse_hkex_frame():
         [4335, "HSBC USD", "Equity", "Trading Only Securities"],
     ])
     got = parse_hkex_frame(raw)
-    assert got == {"00700": {"name_en": "TENCENT", "board": "主板", "fund": False},
-                   "08001": {"name_en": "ORIENT SEC INT", "board": "创业板", "fund": False}}
+    assert got == {"00700": {"name_en": "TENCENT", "board": "主板", "fund": False, "temp": False},
+                   "08001": {"name_en": "ORIENT SEC INT", "board": "创业板", "fund": False, "temp": False}}
+    raw2 = pd.DataFrame([
+        ["Stock Code", "Name of Securities", "Category", "Sub-Category"],
+        [2949, "GREEN POWER RTS", "Equity", "Equity Securities (Main Board)"],
+        [8556, "S ROBOT EDU-OLD", "Equity", "Equity Securities (GEM)"],
+        [1810, "XIAOMI-W", "Equity", "Equity Securities (Main Board)"],
+        [1299, "AIA", "Equity", "Equity Securities (Main Board)"],
+    ])
+    got2 = parse_hkex_frame(raw2)
+    assert [c for c, v in got2.items() if v["temp"]] == ["02949", "08556"]  # 供股权、合股期间的临时柜台
 
 
 def test_parse_tencent_hk_us():
@@ -242,6 +251,9 @@ class FakeGlobal:
         self.list_override = None
         self.fail = set()
         self.calls = []
+        self.yahoo_lag = 0  # Yahoo 的完整历史比实际晚几天（港股收盘后几个小时内是 1）
+        self.lag_except = set()  # 这些股票不受影响（比如刚上市的新股）
+        self.no_trade = set()  # 当天停牌：腾讯行情没有最高、最低价
 
     def stock_list(self):
         codes = self.list_override if self.list_override is not None else self.codes
@@ -260,13 +272,23 @@ class FakeGlobal:
                 continue
             raw = self.raw(code)
             bars, splits = yahoo_from_raw(self.dates[: len(raw)], raw, {10: ("split", 2.0), 20: ("div", 0.3)})
+            if self.yahoo_lag and code not in self.lag_except:
+                bars = bars[: -self.yahoo_lag]
             yield code, (bars, splits, [(self.dates[20], 0.3)]), ""
 
     def latest_date(self):
         return self.dates[self.last_idx]
 
     def quotes(self, syms):
-        return {s: {"name": "中文" + s[2:], "price": self.raw(s[2:])[-1][3], "date": self.dates[self.last_idx]} for s in syms}
+        out = {}
+        for s in syms:
+            raw = self.raw(s[2:])
+            o, h, lo, c = raw[-1]
+            if s[2:] in self.no_trade:
+                h = lo = 0.0
+            out[s] = {"name": "中文" + s[2:], "price": c, "preclose": raw[-2][3], "high": h, "low": lo,
+                      "date": self.dates[self.last_idx]}
+        return out
 
     def hk_issue_info(self):
         self.calls.append(("hk_issue_info", 0))
@@ -321,7 +343,9 @@ def test_global_run_end_to_end(tmp_path):
     # 新的一天：重新下载；失败的股票沿用上次结果
     src.fail = {"00002"}
     up = run_g(src, d, 41)
-    assert up.stocks["00002"].last_trade == src.dates[40] and up.stocks["00002"].fails == 1
+    s2 = up.stocks["00002"]  # Yahoo 下载失败：历史沿用上次的，最新一天用腾讯行情接上
+    assert s2.fails == 1 and s2.fetched == src.dates[40] and s2.last_trade == s2.patched == src.dates[41]
+    assert s2.last_close == pytest.approx(src.raw("00002")[-1][3])
     assert up.stocks["00001"].last_trade == src.dates[41]
     # 新股、退市
     src.codes = src.codes[1:] + ["09999"]
@@ -498,3 +522,186 @@ def test_fundamentals_in_pipeline(tmp_path):
     assert all(r["tscore"] is not None for r in rows)
     assert rows[0]["sector"] in ("科技", "工业") and rows[0]["mcap"] > 0
     assert gp.FUND_MAX_MIN > 0
+
+
+# ---------------- Yahoo 缺最新一天、腾讯补价 ----------------
+def test_missing_adjclose_uses_previous_factor():
+    dates = days(4)
+    bars = [YBar(dates[0], 10, 10, 9, 10, 8.0), YBar(dates[1], 10, 10, 9.5, 10, 8.0),
+            YBar(dates[2], 10, 10, 10, 10, 10.0), YBar(dates[3], 9, 9, 8.8, 9, math.nan)]  # 最新一天没有复权价
+    s = GStock(code="X", mkt="hk")
+    assert compute(s, bars, [], [], dates[-1])
+    assert s.last_trade == dates[3] and s.last_close == 9.0
+    assert s.min_low == pytest.approx(9 * 0.8)  # 第一天的最低价 × 分红调整系数；最新一天沿用系数 1
+
+
+def test_patch_check_and_apply():
+    from bottom.gengine import patch_apply, patch_check
+
+    def st():
+        return GStock(code="00001", mkt="hk", last_trade="2026-11-06", last_close=10.0, min_low=8.0,
+                      min_low_date="2020-01-02", min_close=8.5, min_close_date="2020-01-02", dy=4.0)
+
+    q = {"date": "2026-11-09", "price": 9.5, "preclose": 10.0, "high": 10.1, "low": 9.4}
+    assert patch_check(st(), q, "2026-11-09") == "ok"
+    assert patch_check(st(), q, "2026-11-08") == ""  # 这一天还没收盘，不用
+    assert patch_check(st(), {**q, "date": "2026-11-06"}, "2026-11-09") == ""  # Yahoo 已经有这一天
+    assert patch_check(st(), {**q, "high": 0.0, "low": 0.0}, "2026-11-09") == ""  # 停牌
+    assert patch_check(st(), {**q, "preclose": 9.0}, "2026-11-09") == "mismatch"  # 中间缺了日子，或者拆股合股
+    assert patch_check(st(), {**q, "low": 9.8}, "2026-11-09") == "mismatch"  # 最低价比现价还高：字段有问题
+    s = st()
+    patch_apply(s, q)
+    assert (s.last_trade, s.last_close, s.patched) == ("2026-11-09", 9.5, "2026-11-09")
+    assert s.min_low == 8.0 and s.ratio() == pytest.approx(9.5 / 8.0)
+    assert s.dy == pytest.approx(4.0 * 10 / 9.5)
+    s = st()
+    patch_apply(s, {**q, "price": 7.9, "low": 7.5, "high": 9.9})  # 当天创新低
+    assert (s.min_low, s.min_low_date) == (7.5, "2026-11-09") and (s.min_close, s.min_close_date) == (7.9, "2026-11-09")
+    assert s.ratio() == pytest.approx(7.9 / 7.5)
+    s = st()
+    patch_apply(s, {**q, "low": 0.01})  # 明显错误的最低价不计
+    assert s.min_low == 8.0
+
+
+def test_common_date():
+    from bottom.gengine import common_date
+
+    def g(d, **kw):
+        return GStock(code="x", mkt="hk", last_close=1.0, min_low=1.0, last_trade=d, **kw)
+
+    assert common_date([g("2026-11-06")] * 5 + [g("2026-11-09")] * 2) == "2026-11-06"  # 少数新股领先不算
+    assert common_date([g("2026-11-06")] * 2 + [g("2026-11-09")] * 2) == "2026-11-09"  # 并列取较晚的
+    assert common_date([g("2026-11-09", excluded="spac")] * 9 + [g("2026-11-06")]) == "2026-11-06"
+    assert common_date([]) == ""
+
+
+def test_yahoo_lag_is_patched_from_tencent(tmp_path):
+    """重现 2026-11-09 港股的情况：Yahoo 的完整历史没有当天的日线，只有刚上市的新股有。"""
+    d = str(tmp_path)
+    src = FakeGlobal("hk", n=30)
+    run_g(src, d, 40)
+    src.yahoo_lag, src.lag_except, src.no_trade = 1, {"00001", "00002"}, {"00030"}
+    up = run_g(src, d, 41)
+    day, prev = src.dates[41], src.dates[40]
+    st = up.stocks
+    assert up.meta["market_date"] == day
+    assert st["00001"].last_trade == day and not st["00001"].patched  # Yahoo 自己有
+    s = st["00010"]
+    raw = src.raw("00010")
+    assert s.last_trade == day and s.patched == day and s.last_close == pytest.approx(raw[-1][3])
+    # 补上的结果和 Yahoo 有这一天时算出来的一样（当天没有除权除息）
+    assert s.ratio() == pytest.approx(hfq_truth(raw, {10: ("split", 2.0), 20: ("div", 0.3)}, issue=9.0), rel=1e-9)
+    assert st["00030"].last_trade == prev  # 当天停牌的不补
+    assert sum(1 for x in st.values() if x.last_trade < up.meta["market_date"]) == 1  # 只有它显示“停牌”
+    assert up.meta["settled_date"] == ""  # 靠补价的太多，不算稳定
+    assert any("补上 27 只" in n for n in up.notes)
+    # 下一次运行重新下载；Yahoo 有了这一天，补价标记清掉，数据稳定
+    src.yahoo_lag = 0
+    n = len(src.calls)
+    up = run_g(src, d, 41)
+    assert any(c[0] == "histories" for c in src.calls[n:])
+    assert not any(x.patched for x in up.stocks.values())
+    assert up.meta["settled_date"] == day and up.meta["market_date"] == day
+
+
+def test_yahoo_lag_without_tencent_keeps_previous_date(tmp_path):
+    d = str(tmp_path)
+    src = FakeGlobal("hk", n=30)
+    run_g(src, d, 40)
+    src.yahoo_lag, src.lag_except = 1, {"00001", "00002"}
+    src.quotes = lambda syms: {}  # 腾讯行情也取不到
+    up = run_g(src, d, 41)
+    # 多数股票只到前一天：数据日期按前一天，不会把大多数股票标成“停牌”
+    assert up.meta["market_date"] == src.dates[40]
+    assert up.meta["settled_date"] == ""
+    assert any("下次运行重新下载" in n for n in up.notes)
+
+
+def test_patch_skipped_when_more_than_one_day_behind(tmp_path):
+    d = str(tmp_path)
+    src = FakeGlobal("hk", n=60)
+    run_g(src, d, 40)
+    src.yahoo_lag = 2  # 差两天：腾讯的昨收和已有的最后收盘价接不上
+    up = run_g(src, d, 43)
+    assert not any(s.patched for s in up.stocks.values())
+    assert any("这次不补" in n for n in up.notes)
+    assert up.meta["market_date"] == src.dates[41]
+
+
+def test_us_is_not_patched(tmp_path, monkeypatch):
+    import bottom.gpipeline as gp
+
+    monkeypatch.setattr(gp, "IPO_BACKFILL_FROM", "2024-01")
+    d = str(tmp_path)
+    src = FakeGlobal("us", n=20)
+    run_g(src, d, 40)
+    src.yahoo_lag = 1
+    up = run_g(src, d, 41)
+    assert not any(s.patched for s in up.stocks.values())
+    assert up.meta["market_date"] == src.dates[40] and up.meta["settled_date"] == ""
+
+
+def test_hk_temp_counters_excluded(tmp_path):
+    d = str(tmp_path)
+    src = FakeGlobal("hk", n=10)
+    src.stock_list = lambda: {c: {"name_en": f"CO {c}-OLD" if c == "00003" else f"CO {c}", "board": "主板",
+                                  "fund": False, "temp": c == "00003"} for c in src.codes}
+    up = run_g(src, d, 40)
+    assert up.stocks["00003"].excluded == "temp" and not up.stocks["00003"].has_data()
+    site = str(tmp_path / "site")
+    assert export_market("hk", up.stocks, up.meta, site)["rows"] == 9
+
+
+def test_spac_rules():
+    from bottom.gengine import shell_like
+
+    few = [YBar(d, 10, 10, 10, 10.0, 10.0) for d in days(3, "2026-11-04")]
+    assert spac_like("Haymaker Acquisition Corp V", few, "2026-11-09")  # 刚上市几天，名称就能判断
+    assert not spac_like("Ives Ultra AI Opportunities Inc.", few, "2026-11-09")
+    assert shell_like(GStock(code="IVAI", mkt="us", industry="Shell Companies", last_close=10.11))
+    assert not shell_like(GStock(code="X", mkt="us", industry="Shell Companies", last_close=3.2))  # 并购后股价已经走开
+    assert not shell_like(GStock(code="Y", mkt="us", industry="Software", last_close=10.0))
+
+
+def test_intraday_run_then_evening_run(tmp_path):
+    """2026-11-09 的实际时间线：中午（盘中）手动运行一次，晚上定时运行一次。Yahoo 正常时，晚上应当更新到当天。"""
+    d = str(tmp_path)
+    src = FakeGlobal("hk", n=12)
+    src.dates = days(60, "2026-09-01")
+    i = src.dates.index("2026-11-09")
+
+    def run_at(iso_utc, lag=0):
+        stocks, meta = store.load(d, cls=GStock)
+        src.last_idx, src.yahoo_lag = i, lag
+        up = GlobalUpdater("hk", src, stocks, meta, state_dir=d, now=dt.datetime.fromisoformat(iso_utc), workers=2)
+        up.run("daily")
+        store.save(up.stocks, up.meta, d)
+        return up
+
+    up = run_at("2026-11-09T04:00:00+00:00")  # 香港 12:00，盘中：当天这根不算，也不用腾讯补
+    assert {s.last_trade for s in up.stocks.values()} == {"2026-11-06"} and up.meta["market_date"] == "2026-11-06"
+    assert not any(s.patched for s in up.stocks.values())
+    up = run_at("2026-11-09T14:00:00+00:00")  # 香港 22:00，Yahoo 已有当天
+    assert {s.last_trade for s in up.stocks.values()} == {"2026-11-09"} and up.meta["settled_date"] == "2026-11-09"
+
+
+def test_intraday_run_then_evening_run_with_yahoo_lag(tmp_path):
+    """同样的时间线，但晚上 Yahoo 的完整历史还没有当天（实际发生的情况）：用腾讯行情补上，不再整片显示“停牌”。"""
+    d = str(tmp_path)
+    src = FakeGlobal("hk", n=12)
+    src.dates = days(60, "2026-09-01")
+    i = src.dates.index("2026-11-09")
+
+    def run_at(iso_utc, lag):
+        stocks, meta = store.load(d, cls=GStock)
+        src.last_idx, src.yahoo_lag = i, lag
+        up = GlobalUpdater("hk", src, stocks, meta, state_dir=d, now=dt.datetime.fromisoformat(iso_utc), workers=2)
+        up.run("daily")
+        store.save(up.stocks, up.meta, d)
+        return up
+
+    run_at("2026-11-09T04:00:00+00:00", 0)
+    up = run_at("2026-11-09T14:00:00+00:00", 1)
+    assert {s.last_trade for s in up.stocks.values()} == {"2026-11-09"}
+    assert all(s.patched == "2026-11-09" for s in up.stocks.values())
+    assert up.meta["market_date"] == "2026-11-09" and up.meta["settled_date"] == ""
